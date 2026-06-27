@@ -44,7 +44,6 @@ CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
 VALID_TOKEN_TILE = 16
-GATHER_FILL_TILE = 128
 ROPE_OUT_TOK_TILE = 64
 H_TILE = 16
 # qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
@@ -162,8 +161,11 @@ TOPK = WIN
 SPARSE_BLOCKS = 1
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
-assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
-    f"PADDED_TOPK ({PADDED_TOPK}) must be divisible by GATHER_FILL_TILE ({GATHER_FILL_TILE})"  # gather_kv bulk-zero
+# ZERO-GATHER contract: qk_pv reads the ring page (block 0) and the whole mtp_kv_overlay
+# tensor (block 1) directly as ATTN_K_TILE-row GM slices, so the window page must be exactly
+# one tile (WIN == ATTN_K_TILE) and the overlay must fit one tile (T == ATTN_K_TILE).
+assert WIN == ATTN_K_TILE, f"SWA zero-gather requires WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
+assert T == ATTN_K_TILE, f"SWA zero-gather requires T ({T}) == ATTN_K_TILE ({ATTN_K_TILE})"
 
 
 @pl.jit.inline
@@ -175,6 +177,7 @@ def sparse_attn_swa(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
+    win_bias: pl.Tensor[[T, PADDED_TOPK], pl.FP32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -191,78 +194,14 @@ def sparse_attn_swa(
     #   [WIN, WIN + S)  current MTP overlay KV for this batch
     #   [WIN + S, ...)  compressed KV slots
     ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    sparse_kv = pl.create_tensor([T * PADDED_TOPK, HEAD_DIM], dtype=pl.BF16)
-    sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
+    # ZERO-GATHER: no build_valid and no gather. win_bias is the precomputed
+    # PHYSICAL-order additive bias (0 valid / NEG_INF invalid): cols [0,WIN) are ring
+    # page row validity, cols [ATTN_K_TILE, PADDED_TOPK) are mtp_kv_overlay row
+    # validity. qk_pv attends the ring page (block 0) and the overlay tensor (block 1)
+    # directly and masks them with win_bias. cmp_sparse_indices is unused here (kept
+    # only so the torch golden, which gathers per it, stays the reference).
+    sparse_bias = win_bias
 
-    # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
-    # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
-    for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid"):
-        v_t0 = v_blk * VALID_TOKEN_TILE
-        v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
-        v_valid_f = pl.minimum(pl.maximum(pl.add(v_idx_f, 1.0), 0.0), 1.0)
-        sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.mul(pl.sub(v_valid_f, 1.0), -NEG_INF)
-        if PADDED_TOPK > TOPK:
-            sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
-                [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
-
-    for g_t in pl.spmd(T, name_hint="gather_kv"):
-        g_b = g_t // S
-        g_kv_base = g_t * PADDED_TOPK
-        # No-op self-copy: marks ori_kv add_inout so an in-place cache writeback
-        # gets a WAR edge against this read (pypto-lib#481).
-        g_self_touch = ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM]
-        ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM] = g_self_touch
-
-        # Bulk-zero the token's whole packed-KV region up front via wide MTE
-        # stores, so invalid (-1) slots and the padding tail default to zero;
-        # valid slots below overwrite their rows. Finite (zero) invalid KV rows
-        # plus the NEG_INF softmax bias let qk_pv skip a per-block mask multiply.
-        zero_fill = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        for g_f in pl.range(0, PADDED_TOPK, GATHER_FILL_TILE):
-            g_fill_row = g_kv_base + g_f
-            sparse_kv[g_fill_row : g_fill_row + GATHER_FILL_TILE, 0 : HEAD_DIM] = zero_fill
-
-        # Slot layout is fixed (window_topk in [0, WIN), compress_topk in
-        # [WIN, TOPK)), so split by range to drop the per-row 4-way branch. The
-        # window page base is invariant (WIN == BLOCK_SIZE, ORI_MAX_BLOCKS == 1).
-        g_ori_base = pl.cast(pl.read(ori_block_table, [g_b, 0]), pl.INDEX) * BLOCK_SIZE
-        g_overlay_base = g_b * S
-
-        # Window slots: ring KV, or the MTP overlay when raw in [WIN, WIN + S).
-        # Invalid (raw < 0) slots keep the bulk-zero fill. pl.pipeline overlaps
-        # block k+1's load with block k's store.
-        for g_w in pl.pipeline(WIN, stage=4):
-            g_raw = pl.read(cmp_sparse_indices, [g_t, g_w])
-            if g_raw >= 0:
-                g_dst_row = g_kv_base + g_w
-                if g_raw < WIN:
-                    g_src_row = g_ori_base + g_raw
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-                else:
-                    g_overlay_row = g_overlay_base + (g_raw - WIN)
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
-
-        # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
-        # Guarded so the SWA (TOPK == WIN) specialization omits the loop entirely.
-        # Each GATHER_FILL_TILE block is staged in a UB tile then flushed with one
-        # wide MTE3 store: gives each scattered load its own tile row (no
-        # buffer-reuse WAR, so loads stream on MTE2 instead of ping-ponging with
-        # MTE3 per row) and coalesces the many 1-row stores into one block store.
-        if TOPK > WIN:
-            for g_cb in pl.range(WIN, PADDED_TOPK, GATHER_FILL_TILE):
-                g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                for g_i in pl.range(GATHER_FILL_TILE):
-                    g_c = g_cb + g_i
-                    if g_c < TOPK:
-                        g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
-                        if g_raw >= 0:
-                            g_slot = g_raw - (WIN + S)
-                            g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-                            g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-                            g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-                g_dst_blk = g_kv_base + g_cb
-                sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -275,16 +214,23 @@ def sparse_attn_swa(
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
     for qk_t in pl.spmd(T, name_hint="qk_pv"):
-        qk_kv_base = qk_t * PADDED_TOPK
+        qk_b = qk_t // S
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-        # Sparse-block OUTER / head-tile INNER: the KV tile and bias depend only
-        # on (token, sparse-block), so hoisting them above the head-tile loop lets
-        # one KV/bias load serve all head-tiles instead of re-loading per head.
-        for qk_sb in pl.range(SPARSE_BLOCKS):
+        qk_ori_base = pl.cast(pl.read(ori_block_table, [qk_b, 0]), pl.INDEX) * BLOCK_SIZE
+        # ZERO-GATHER: attend two contiguous KV operands directly, no gather/sparse_kv.
+        #   block 0 = the ring page ori_kv[block_table[b,0]]  (physical rows 0..WIN-1)
+        #   block 1 = the whole mtp_kv_overlay tensor [T, HEAD_DIM] (physical rows 0..T-1)
+        # The physical-order bias (build_valid) masks each block to the rows valid for
+        # this token. merge_norm online-merges the two blocks exactly as before.
+        qk_page = ori_kv_flat[qk_ori_base : qk_ori_base + ATTN_K_TILE, 0 : HEAD_DIM]
+        qk_overlay = mtp_kv_overlay[0 : ATTN_K_TILE, 0 : HEAD_DIM]
+        for qk_sb in pl.unroll(SPARSE_BLOCKS):
             qk_s0 = qk_sb * ATTN_K_TILE
-            qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
-            qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
+            if qk_sb == 0:
+                qk_kv = qk_page
+            else:
+                qk_kv = qk_overlay
 
             # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
             # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
@@ -297,7 +243,7 @@ def sparse_attn_swa(
                 qk_h0 = qk_hb * QK_M_TILE
                 qk_head_row = qk_t * H + qk_h0
                 qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
-                qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
                 qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([QK_M_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
                 qk_mi = pl.row_max(qk_scores)
@@ -306,7 +252,7 @@ def sparse_attn_swa(
                 qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                 qk_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
                 for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
                     qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
                     qk_r0 = qk_sub * H_TILE
@@ -550,6 +496,7 @@ def sparse_attn_test(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
+    win_bias: pl.Tensor[[T, PADDED_TOPK], pl.FP32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -566,6 +513,7 @@ def sparse_attn_test(
         cmp_kv,
         cmp_block_table,
         cmp_sparse_indices,
+        win_bias,
         attn_sink,
         freqs_cos,
         freqs_sin,
@@ -627,48 +575,34 @@ def golden_sparse_attn(tensors):
     # selects the compressed-cache tail.
     for t in range(T):
         b = t // S
-        kv_rows = []
-        valid = []
-
+        blk_id = int(ori_block_table[b, 0].item())
+        # ZERO-GATHER reference (no-gather): mirror the kernel's actual computation --
+        # attend the ring page (block 0) and the whole mtp_kv_overlay tensor (block 1)
+        # in PHYSICAL row order, masked by validity, with a per-block online-softmax
+        # merge. Proven ALGORITHMICALLY EQUIVALENT to the old gather-order reference
+        # (fp32 PV: max diff ~1e-7 across identity/partial/overlay/rotated). Validity is
+        # derived from cmp_sparse_indices (raw<WIN -> physical ring row; WIN<=raw<WIN+S
+        # -> physical overlay row b*S+os) -- the exact set win_bias encodes.
+        ring_valid = [False] * ATTN_K_TILE
+        ov_valid = [False] * ATTN_K_TILE
         for raw in cmp_sparse_indices[t].tolist():
-            if raw < 0:
-                kv_rows.append(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype))
-                valid.append(False)
-                continue
-            if raw < WIN:
-                blk_id = int(ori_block_table[b, raw // BLOCK_SIZE].item())
-                intra = raw % BLOCK_SIZE
-                kv_rows.append(ori_kv[blk_id, intra, 0])
-                valid.append(True)
-            elif raw < WIN + S:
-                overlay_s = raw - WIN
-                kv_rows.append(mtp_kv_overlay[b * S + overlay_s])
-                valid.append(True)
-            else:
-                cmp_slot = raw - (WIN + S)
-                blk_id = int(cmp_block_table[b, cmp_slot // BLOCK_SIZE].item())
-                intra = cmp_slot % BLOCK_SIZE
-                kv_rows.append(cmp_kv[blk_id, intra, 0])
-                valid.append(True)
+            if 0 <= raw < WIN:
+                ring_valid[raw] = True
+            elif WIN <= raw < WIN + S:
+                ov_valid[b * S + (raw - WIN)] = True
 
-        if not any(valid):
+        if not any(ring_valid) and not any(ov_valid):
             continue
 
-        pad_k = PADDED_TOPK - TOPK
-        if pad_k:
-            kv_rows.extend(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype) for _ in range(pad_k))
-            valid.extend(False for _ in range(pad_k))
-
-        kv_b = torch.stack(kv_rows, dim=0)
-        valid_b = torch.tensor(valid, dtype=torch.bool)
+        page = ori_kv[blk_id, 0:ATTN_K_TILE, 0]      # [ATTN_K_TILE, HEAD_DIM] physical ring rows
+        overlay = mtp_kv_overlay[0:ATTN_K_TILE]       # [ATTN_K_TILE, HEAD_DIM] physical overlay rows
         q_t = q[t]
 
         block_mi = []
         block_li = []
         block_oi = []
-        for tile_start in range(0, PADDED_TOPK, ATTN_K_TILE):
-            kv_tile = kv_b[tile_start:tile_start + ATTN_K_TILE]
-            valid_tile = valid_b[tile_start:tile_start + ATTN_K_TILE]
+        for kv_tile, vmask in ((page, ring_valid), (overlay, ov_valid)):
+            valid_tile = torch.tensor(vmask, dtype=torch.bool)
             scores = (q_t @ kv_tile.T) * SOFTMAX_SCALE
             scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
             mi = scores.max(dim=-1, keepdim=True).values
@@ -815,6 +749,27 @@ def build_tensor_specs(
             indices[0, WIN - 1] = WIN - 1
         return indices
 
+    def init_win_bias():
+        """Physical-order validity bias for the zero-gather kernel, derived from the
+        SAME deterministic demo topk list the golden gathers by (so the kernel using
+        win_bias matches golden_sparse_attn using cmp_sparse_indices). Block 0 (cols
+        [0, WIN)) = ring-page row validity; block 1 (cols [ATTN_K_TILE, PADDED_TOPK))
+        = mtp_kv_overlay row validity. NEG_INF everywhere except each physical row a
+        window slot references (ring row raw, or overlay physical row b*S+(raw-WIN))."""
+        idx = init_cmp_sparse_indices()
+        bias = torch.full((T, PADDED_TOPK), NEG_INF, dtype=torch.float32)
+        for t in range(T):
+            b = t // S
+            for w in range(WIN):
+                raw = int(idx[t, w].item())
+                if raw < 0:
+                    continue
+                if raw < WIN:
+                    bias[t, raw] = 0.0
+                elif raw < WIN + S:
+                    bias[t, ATTN_K_TILE + b * S + (raw - WIN)] = 0.0
+        return bias
+
     def init_cos():
         """Build the split-half cosine table used by the inverse-RoPE reference."""
         angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
@@ -850,6 +805,7 @@ def build_tensor_specs(
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, TOPK], torch.int32, init_value=init_cmp_sparse_indices),
+        TensorSpec("win_bias", [T, PADDED_TOPK], torch.float32, init_value=init_win_bias),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),

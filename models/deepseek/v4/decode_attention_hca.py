@@ -30,7 +30,7 @@ from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
 from decode_compressor_ratio128 import compressor_ratio128
-from decode_sparse_attn_hca import sparse_attn_hca
+from decode_sparse_attn_hca import sparse_attn_hca, PADDED_TOPK
 
 
 # model config
@@ -75,13 +75,17 @@ SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (stat
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
 HCA_TOPK_LIMIT = min(CMP_TOPK, SPARSE_IDX_TOPK)
 
-HCA_SPARSE_TOPK = WIN + HCA_TOPK_LIMIT
+# ZERO-GATHER: block 0 = window page (slots [0,WIN)), block 1 = S relocated overlay
+# slots + the compressed tail, padded to PADDED_TOPK (the kernel reads the full,
+# 32-byte-aligned PADDED_TOPK width; the tail past WIN+S+compressed stays -1).
+HCA_SPARSE_TOPK = PADDED_TOPK
 
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 HCA_TOPK_TOKEN_TILE = 8   # tokens per overlay-topk SPMD block
 HCA_WB_TOKEN_TILE = 32  # tokens per cache-writeback SPMD block
+WRITEBACK_GUARD_TILE = 16  # head cols folded with attn_out*0 to order the writeback after sparse_attn's gather
 
 
 @pl.jit.inline
@@ -196,6 +200,10 @@ def attention_hca(
                 topk_s = topk_t - topk_b * S
                 topk_abs_pos = pl.read(position_ids, [topk_t])
 
+                # Block 0 (slots [0,WIN)) = PHYSICAL window page (slot k -> ring row k),
+                # zero-gathered by the kernel. Valid iff k <= abs_pos AND k is NOT a
+                # current-token ring slot (those hold stale KV and are attended via the
+                # overlay in block 1). build_valid turns this into the page's bias.
                 for topk_k in pl.range(WIN):
                     if topk_k <= topk_abs_pos:
                         topk_out = topk_k
@@ -204,20 +212,28 @@ def attention_hca(
                                 topk_overlay_t = topk_b * S + topk_os
                                 topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
                                 if topk_k == topk_overlay_pos % WIN:
-                                    topk_out = WIN + topk_os
+                                    topk_out = -1
                         pl.write(topk_all, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
                     else:
                         pl.write(topk_all, [topk_t, topk_k], pl.cast(-1, pl.INT32))
 
+                # Block 1 head: S relocated overlay slots (raw WIN+os), gathered.
+                for topk_os in pl.range(S):
+                    if topk_os <= topk_s:
+                        pl.write(topk_all, [topk_t, WIN + topk_os], pl.cast(WIN + topk_os, pl.INT32))
+                    else:
+                        pl.write(topk_all, [topk_t, WIN + topk_os], pl.cast(-1, pl.INT32))
+
+                # Block 1 tail: compressed slots (raw WIN+S+ck), gathered.
                 topk_cmp_valid = pl.min(
                     HCA_TOPK_LIMIT,
                     pl.min((topk_abs_pos + 1) // COMPRESS_RATIO, pl.read(kv_seq_lens, [topk_b]) // COMPRESS_RATIO),
                 )
-                for topk_ck in pl.range(HCA_SPARSE_TOPK - WIN):
+                for topk_ck in pl.range(HCA_SPARSE_TOPK - WIN - S):
                     if topk_ck < topk_cmp_valid:
-                        pl.write(topk_all, [topk_t, WIN + topk_ck], pl.cast(WIN + S + topk_ck, pl.INT32))
+                        pl.write(topk_all, [topk_t, WIN + S + topk_ck], pl.cast(WIN + S + topk_ck, pl.INT32))
                     else:
-                        pl.write(topk_all, [topk_t, WIN + topk_ck], pl.cast(-1, pl.INT32))
+                        pl.write(topk_all, [topk_t, WIN + S + topk_ck], pl.cast(-1, pl.INT32))
 
     sparse_attn_hca(
         q, kv_cache, ori_block_table, kv,
@@ -242,7 +258,17 @@ def attention_hca(
             write_t = wb_t0 + write_dt
             write_row = pl.cast(pl.read(ori_slot_mapping, [write_t]), pl.INDEX)
             if write_row >= 0:
-                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+                # Fold attn_out*0 into the first WRITEBACK_GUARD_TILE cols so the
+                # writeback data-depends on attn_out -> it cannot run until
+                # sparse_attn has finished its in-qk_pv gather of the old cache.
+                # Needed because the fused gather_row read is not a tracked tile
+                # load, so the kv_touch marker alone does not order it (pypto-lib#481).
+                write_guard = pl.cast(attn_out[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
+                write_zero = pl.mul(write_guard, 0.0)
+                write_kv_head = pl.cast(kv[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
+                kv_cache_flat[write_row : write_row + 1, 0 : WRITEBACK_GUARD_TILE] = pl.cast(
+                    pl.add(write_kv_head, write_zero), target_type=pl.BF16)
+                kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE : HEAD_DIM] = kv[write_t : write_t + 1, WRITEBACK_GUARD_TILE : HEAD_DIM]
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
@@ -403,28 +429,28 @@ def golden_attention_hca(tensors):
         "state_slot_mapping": state_slot_mapping_bsd,
     })
 
+    # ZERO-GATHER layout (must mirror the wrapper's hca_overlay_topk EXACTLY so the
+    # golden's block-0 gather lands in the same PHYSICAL order as the kernel's page
+    # read -- bf16 PV is not associative): block 0 [0,WIN) = physical window (slot k ->
+    # ring row k, live iff k<=abs_pos AND k is not a current-token ring slot); block 1
+    # head [WIN,WIN+S) = relocated overlay; block 1 tail [WIN+S,..) = compressed.
     topk_all = torch.full((T, HCA_SPARSE_TOPK), -1, dtype=torch.int32)
     for t in range(T):
         b = t // S
         s = t % S
         abs_pos = int(position_ids[t].item())
-        if abs_pos >= win - 1:
-            win_start = (abs_pos % win) + 1
-            vals = ((torch.arange(win, dtype=torch.int32) + win_start) % win).tolist()
-        else:
-            vals = list(range(abs_pos + 1))
         overlay_slots = {
             int(position_ids[b * S + os].item()) % win: os
             for os in range(s + 1)
         }
-        for k, raw in enumerate(vals):
-            if raw in overlay_slots:
-                topk_all[t, k] = WIN + overlay_slots[raw]
-            else:
-                topk_all[t, k] = raw
+        for k in range(win):
+            if k <= abs_pos and k not in overlay_slots:
+                topk_all[t, k] = k
+        for os in range(s + 1):
+            topk_all[t, win + os] = WIN + os
         cmp_valid = min(HCA_TOPK_LIMIT, (abs_pos + 1) // ratio, int(kv_seq_lens[b].item()) // ratio)
         if cmp_valid:
-            topk_all[t, win:win + cmp_valid] = torch.arange(cmp_valid, dtype=torch.int32) + win + S
+            topk_all[t, win + S:win + S + cmp_valid] = torch.arange(cmp_valid, dtype=torch.int32) + win + S
 
     golden_sparse_attn({
         "q": q,

@@ -22,7 +22,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
-from decode_sparse_attn_swa import sparse_attn_swa
+from decode_sparse_attn_swa import sparse_attn_swa, ATTN_K_TILE, PADDED_TOPK, NEG_INF
 
 
 # model config
@@ -60,6 +60,9 @@ SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 SWA_TOPK_TOKEN_TILE = 8   # tokens per overlay-topk SPMD block
 SWA_WB_TOKEN_TILE = 32  # tokens per cache-writeback SPMD block
+WRITEBACK_GUARD_TILE = 16  # head cols folded with attn_out*0 to order the writeback after sparse_attn
+S_F = float(S)            # float consts for the win_bias build (float() is not callable inside the tracer)
+WIN_F = float(WIN)
 
 @pl.jit.inline
 def attention_swa(
@@ -131,32 +134,56 @@ def attention_swa(
     # one serial CORE_GROUP loop. The two abs_pos branches collapse into one:
     # column k -> ring slot k, live iff k <= abs_pos. sparse_attn pairs each K/V by
     # its stored raw value (order-agnostic), so the full-ring rotation is dead.
-    sparse_topk = pl.create_tensor([T, WIN], dtype=pl.INT32)
-    for topk_block in pl.spmd(T // SWA_TOPK_TOKEN_TILE, name_hint="swa_overlay_topk"):
-        topk_t0 = topk_block * SWA_TOPK_TOKEN_TILE
-        for topk_dt in pl.range(SWA_TOPK_TOKEN_TILE):
-            topk_t = topk_t0 + topk_dt
-            if topk_t < T:
-                topk_b = topk_t // S
-                topk_s = topk_t - topk_b * S
-                topk_abs_pos = pl.read(position_ids, [topk_t])
-                for topk_k in pl.range(WIN):
-                    if topk_k <= topk_abs_pos:
-                        topk_out = topk_k
-                        for topk_os in pl.range(S):
-                            if topk_os <= topk_s:
-                                topk_overlay_t = topk_b * S + topk_os
-                                topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                if topk_k == topk_overlay_pos % WIN:
-                                    topk_out = WIN + topk_os
-                        pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
-                    else:
-                        pl.write(sparse_topk, [topk_t, topk_k], pl.cast(-1, pl.INT32))
+    # ZERO-GATHER: build the PHYSICAL-order softmax bias win_bias[T, PADDED_TOPK] from
+    # position_ids via vector masks (the prefill_sparse_attn row_expand idiom) -- NO
+    # gather, NO scatter, NO scalar-float ops (per-row scalars enter as [1,1] tensors;
+    # every store targets a STATIC column slice). cols [0,WIN) = ring-page row validity,
+    # cols [ATTN_K_TILE,PADDED_TOPK) = mtp_kv_overlay row validity. Ring row r valid iff
+    # r<=abs_pos AND r is not a current MTP token's ring slot (pos%WIN, those attend via
+    # the overlay); overlay row o valid iff b*S<=o<=t (causal). sparse_topk is a
+    # placeholder kept only for the (unused) kernel cmp_sparse_indices slot.
+    sparse_topk = pl.create_tensor([T, TOPK], dtype=pl.INT32)
+    win_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
+    for wb_blk in pl.spmd(T // SWA_TOPK_TOKEN_TILE, name_hint="swa_win_bias"):
+        wb_t0 = wb_blk * SWA_TOPK_TOKEN_TILE
+        # Index tensors built INSIDE the InCore block (tensor ops can't sit in the
+        # orchestration body). Per-TILE (M=SWA_TOPK_TOKEN_TILE rows): [M,1] / [M,WIN]
+        # tiles satisfy the 32-byte column alignment (a [1,1] tile is only 4 bytes).
+        wb_idx = pl.cast(pl.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)        # [1,WIN]
+        wb_tok_full = pl.cast(pl.reshape(pl.arange(0, [1, T], dtype=pl.INT32), [T, 1]), target_type=pl.FP32)  # [T,1] token idx
+        wb_base_full = pl.mul(
+            pl.cast(pl.cast(pl.mul(wb_tok_full, 1.0 / S), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32), S_F)
+        wb_idx_m = pl.col_expand(pl.full([SWA_TOPK_TOKEN_TILE, WIN], dtype=pl.FP32, value=0.0), wb_idx)  # [M,WIN]
+        wb_abs = pl.cast(pl.reshape(position_ids[wb_t0 : wb_t0 + SWA_TOPK_TOKEN_TILE], [SWA_TOPK_TOKEN_TILE, 1]), target_type=pl.FP32)
+        wb_tok = wb_tok_full[wb_t0 : wb_t0 + SWA_TOPK_TOKEN_TILE, 0 : 1]
+        wb_base_c = wb_base_full[wb_t0 : wb_t0 + SWA_TOPK_TOKEN_TILE, 0 : 1]
+        wb_s = pl.sub(wb_tok, wb_base_c)                                            # [M,1] = t % S (0/1)
+        # MTP positions are consecutive within a batch, so the os-th overlay token's
+        # position is abs_pos - s + os; its ring slot is that % WIN.
+        wb_os0_pos = pl.sub(wb_abs, wb_s)                                           # [M,1]
+        wb_ov0 = pl.sub(wb_os0_pos, pl.mul(
+            pl.cast(pl.cast(pl.mul(wb_os0_pos, 1.0 / WIN), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32), WIN_F))
+        wb_ov1_pos = pl.add(wb_os0_pos, 1.0)                                        # [M,1]
+        wb_ov1 = pl.sub(wb_ov1_pos, pl.mul(
+            pl.cast(pl.cast(pl.mul(wb_ov1_pos, 1.0 / WIN), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32), WIN_F))
+        # ring valid iff (r <= abs_pos) AND (r != ov0_slot) AND (r != ov1_slot when s>=1)
+        wb_le = pl.minimum(pl.maximum(pl.add(pl.neg(pl.row_expand_sub(wb_idx_m, wb_abs)), 1.0), 0.0), 1.0)
+        wb_ne0 = pl.minimum(pl.abs(pl.row_expand_sub(wb_idx_m, wb_ov0)), 1.0)
+        wb_ne1 = pl.minimum(pl.abs(pl.row_expand_sub(wb_idx_m, wb_ov1)), 1.0)
+        # apply ne1 only on s>=1 rows: ne1_eff = 1 - s*(1 - ne1)
+        wb_ne1_eff = pl.add(pl.neg(pl.row_expand_mul(pl.add(pl.neg(wb_ne1), 1.0), wb_s)), 1.0)
+        wb_valid_ring = pl.mul(pl.mul(wb_le, wb_ne0), wb_ne1_eff)
+        win_bias[wb_t0 : wb_t0 + SWA_TOPK_TOKEN_TILE, 0 : WIN] = pl.mul(pl.sub(wb_valid_ring, 1.0), -NEG_INF)
+        # overlay valid iff b*S <= o <= t
+        wb_ge = pl.minimum(pl.maximum(pl.add(pl.row_expand_sub(wb_idx_m, wb_base_c), 1.0), 0.0), 1.0)
+        wb_leov = pl.minimum(pl.maximum(pl.add(pl.neg(pl.row_expand_sub(wb_idx_m, wb_tok)), 1.0), 0.0), 1.0)
+        win_bias[wb_t0 : wb_t0 + SWA_TOPK_TOKEN_TILE, ATTN_K_TILE : PADDED_TOPK] = pl.mul(pl.sub(pl.mul(wb_ge, wb_leov), 1.0), -NEG_INF)
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn_swa(
         q, kv_cache, block_table, kv,
         cmp_kv, cmp_block_table, sparse_topk,
+        win_bias,
         attn_sink, rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
     )
@@ -166,18 +193,24 @@ def attention_swa(
     kv_cache_flat = pl.reshape(kv_cache, [B * ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
     for wb_blk in pl.spmd(T // SWA_WB_TOKEN_TILE, name_hint="swa_cache_writeback"):
         wb_t0 = wb_blk * SWA_WB_TOKEN_TILE
-        # No-op self-copy marks kv_cache_flat add_inout for the WAR edge vs
-        # sparse_attn's read (pypto-lib#481); row 0 is batch 0's intra-0 slot, only
-        # ever written by batch-0 tokens, which all live in this same block 0, so
-        # there is no cross-block race.
-        if wb_blk == 0:
-            kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
-            kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
         for write_dt in pl.range(SWA_WB_TOKEN_TILE):
             write_t = wb_t0 + write_dt
             write_row = pl.cast(pl.read(ori_slot_mapping, [write_t]), pl.INDEX)
             if write_row >= 0:
-                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+                # WAR guard: the ZERO-GATHER kernel reads the ring page directly, so a
+                # token's writeback to slot p%WIN must not race a *sibling* token's
+                # valid read of that same slot (e.g. start=127: the s=1 token writes
+                # ring slot 0, which the s=0 token reads as historical pos 0). Folding a
+                # zeroed attn_out read into only the first WRITEBACK_GUARD_TILE cols
+                # (one 32-byte burst -> serializes the whole row's writeback) orders this
+                # store after sparse_attn produced attn_out, with no data change; the
+                # remaining cols are a raw copy (no cast/arith) (pypto-lib#481).
+                write_guard = pl.cast(attn_out[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
+                write_zero = pl.mul(write_guard, 0.0)
+                write_kv_head = pl.cast(kv[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
+                kv_cache_flat[write_row : write_row + 1, 0 : WRITEBACK_GUARD_TILE] = pl.cast(
+                    pl.add(write_kv_head, write_zero), target_type=pl.BF16)
+                kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE : HEAD_DIM] = kv[write_t : write_t + 1, WRITEBACK_GUARD_TILE : HEAD_DIM]
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out

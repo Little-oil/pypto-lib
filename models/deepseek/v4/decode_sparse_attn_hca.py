@@ -44,7 +44,6 @@ CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
 VALID_TOKEN_TILE = 16
-GATHER_FILL_TILE = 128
 ROPE_OUT_TOK_TILE = 64
 H_TILE = 16
 # qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
@@ -156,15 +155,17 @@ def get_standalone_cmp_valid(compress_ratio: int) -> int:
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
 
 
-# HCA sparse-K width: window plus the deterministic ratio-128 compressed tail.
-TOPK = WIN + min(MAX_SEQ_LEN // 128, IDX_TOPK)
+# HCA sparse-K width: window (block 0, zero-gather) + S relocated overlay slots +
+# the deterministic ratio-128 compressed tail (both in block 1, gathered).
+TOPK = WIN + S + min(MAX_SEQ_LEN // 128, IDX_TOPK)
 # Floor to 2: a single sparse-K block miscompiles in pypto (S-stride cross-token
 # output mixup); a 2-block build with an all-invalid 2nd block is bit-exact.
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
-assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
-    f"PADDED_TOPK ({PADDED_TOPK}) must be divisible by GATHER_FILL_TILE ({GATHER_FILL_TILE})"  # gather_kv bulk-zero
+# ZERO-GATHER contract: block 0 reads the window ring page directly as an ATTN_K_TILE-row
+# GM slice, so the window page must be exactly one tile.
+assert WIN == ATTN_K_TILE, f"HCA zero-gather requires WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
 
 
 @pl.jit.inline
@@ -175,7 +176,7 @@ def sparse_attn_hca(
     mtp_kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[T, PADDED_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -193,77 +194,30 @@ def sparse_attn_hca(
     #   [WIN + S, ...)  compressed KV slots
     ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    sparse_kv = pl.create_tensor([T * PADDED_TOPK, HEAD_DIM], dtype=pl.BF16)
     sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
 
     # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
     # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
     for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid"):
         v_t0 = v_blk * VALID_TOKEN_TILE
-        v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
+        # Read the full PADDED_TOPK (256, 32-byte aligned); cmp_sparse_indices pads its
+        # tail with -1, so the padded lanes get a NEG_INF bias for free.
+        v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : PADDED_TOPK], target_type=pl.FP32)
         v_valid_f = pl.minimum(pl.maximum(pl.add(v_idx_f, 1.0), 0.0), 1.0)
-        sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.mul(pl.sub(v_valid_f, 1.0), -NEG_INF)
-        if PADDED_TOPK > TOPK:
-            sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
-                [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
+        sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : PADDED_TOPK] = pl.mul(pl.sub(v_valid_f, 1.0), -NEG_INF)
 
-    for g_t in pl.spmd(T, name_hint="gather_kv"):
-        g_b = g_t // S
-        g_kv_base = g_t * PADDED_TOPK
-        # No-op self-copy: marks ori_kv add_inout so an in-place cache writeback
-        # gets a WAR edge against this read (pypto-lib#481).
-        g_self_touch = ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM]
-        ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM] = g_self_touch
+    # ZERO-GATHER (block 0): no kv_touch. Block 0 reads the ring page as a DIRECT GM
+    # slice (tracked by the dep system), so the layer's KV-cache writeback gets its WAR
+    # edge for free (the wrapper still folds an attn_out write-guard for robustness).
+    # Block 1 still gathers, but only mtp_kv_overlay/cmp_kv -- never ori_kv -- so there
+    # is no untracked ori_kv read left.
 
-        # Bulk-zero the token's whole packed-KV region up front via wide MTE
-        # stores, so invalid (-1) slots and the padding tail default to zero;
-        # valid slots below overwrite their rows. Finite (zero) invalid KV rows
-        # plus the NEG_INF softmax bias let qk_pv skip a per-block mask multiply.
-        zero_fill = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        for g_f in pl.range(0, PADDED_TOPK, GATHER_FILL_TILE):
-            g_fill_row = g_kv_base + g_f
-            sparse_kv[g_fill_row : g_fill_row + GATHER_FILL_TILE, 0 : HEAD_DIM] = zero_fill
-
-        # Slot layout is fixed (window_topk in [0, WIN), compress_topk in
-        # [WIN, TOPK)), so split by range to drop the per-row 4-way branch. The
-        # window page base is invariant (WIN == BLOCK_SIZE, ORI_MAX_BLOCKS == 1).
-        g_ori_base = pl.cast(pl.read(ori_block_table, [g_b, 0]), pl.INDEX) * BLOCK_SIZE
-        g_overlay_base = g_b * S
-
-        # Window slots: ring KV, or the MTP overlay when raw in [WIN, WIN + S).
-        # Invalid (raw < 0) slots keep the bulk-zero fill. pl.pipeline overlaps
-        # block k+1's load with block k's store.
-        for g_w in pl.pipeline(WIN, stage=4):
-            g_raw = pl.read(cmp_sparse_indices, [g_t, g_w])
-            if g_raw >= 0:
-                g_dst_row = g_kv_base + g_w
-                if g_raw < WIN:
-                    g_src_row = g_ori_base + g_raw
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-                else:
-                    g_overlay_row = g_overlay_base + (g_raw - WIN)
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
-
-        # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
-        # Guarded so the SWA (TOPK == WIN) specialization omits the loop entirely.
-        # Each GATHER_FILL_TILE block is staged in a UB tile then flushed with one
-        # wide MTE3 store: gives each scattered load its own tile row (no
-        # buffer-reuse WAR, so loads stream on MTE2 instead of ping-ponging with
-        # MTE3 per row) and coalesces the many 1-row stores into one block store.
-        if TOPK > WIN:
-            for g_cb in pl.range(WIN, PADDED_TOPK, GATHER_FILL_TILE):
-                g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                for g_i in pl.range(GATHER_FILL_TILE):
-                    g_c = g_cb + g_i
-                    if g_c < TOPK:
-                        g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
-                        if g_raw >= 0:
-                            g_slot = g_raw - (WIN + S)
-                            g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-                            g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-                            g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-                g_dst_blk = g_kv_base + g_cb
-                sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
+    # Flash-fusion: the per-token compressed+overlay gather is folded INTO qk_pv
+    # (below) -- each (token, sparse-block) gathers its ATTN_K_TILE rows straight
+    # into an L1 matmul operand via pl.gather_row (GM->L1, no tmov), so the sparse_kv
+    # GM staging tensor and the standalone gather_kv kernel are gone. Raw-index
+    # contract unchanged (line 124); invalid (raw < 0) lanes gather row 0, and padded
+    # (k >= TOPK) lanes skip the gather entirely (the NEG_INF bias zeros them).
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -276,16 +230,46 @@ def sparse_attn_hca(
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
     for qk_t in pl.spmd(T, name_hint="qk_pv"):
-        qk_kv_base = qk_t * PADDED_TOPK
+        qk_b = qk_t // S
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-        # Sparse-block OUTER / head-tile INNER: the KV tile and bias depend only
-        # on (token, sparse-block), so hoisting them above the head-tile loop lets
-        # one KV/bias load serve all head-tiles instead of re-loading per head.
-        for qk_sb in pl.range(SPARSE_BLOCKS):
+        qk_ori_base = pl.cast(pl.read(ori_block_table, [qk_b, 0]), pl.INDEX) * BLOCK_SIZE
+        qk_overlay_base = qk_b * S
+        # Sparse-block OUTER / head-tile INNER: gather the block's KV into L1 once,
+        # then both head-batches' QK (b_trans) and PV consume the SAME tile.
+        for qk_sb in pl.unroll(SPARSE_BLOCKS):
             qk_s0 = qk_sb * ATTN_K_TILE
-            qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
-            qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
+            if qk_sb == 0:
+                # ZERO-GATHER block 0 = window ring page ori_kv[block_table[b,0]]
+                # (physical rows 0..WIN-1) read as a DIRECT GM slice -- no gather_row.
+                # cmp_sparse_indices[0:WIN] is physical/identity order with the
+                # current-token ring slots set to -1, so build_valid's bias masks each
+                # page row exactly (the overlay rows are attended in block 1 instead).
+                qk_kv = ori_kv_flat[qk_ori_base : qk_ori_base + ATTN_K_TILE, 0 : HEAD_DIM]
+            else:
+                # Block 1 = relocated overlay + compressed rows, gathered into an L1
+                # matmul operand. Invalid (raw < 0) lanes gather row 0; padded
+                # (qk_k >= TOPK) lanes skip the gather (NEG_INF bias zeros their weight).
+                qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
+                for qk_r in pl.range(ATTN_K_TILE):
+                    qk_k = qk_s0 + qk_r
+                    if qk_k < TOPK:
+                        qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_k])
+                        if qk_ridx >= 0:
+                            if qk_ridx < WIN:
+                                qk_src = qk_ori_base + qk_ridx
+                                qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [qk_src, 0], [1, HEAD_DIM])
+                            elif qk_ridx < WIN + S:
+                                qk_ov = qk_overlay_base + (qk_ridx - WIN)
+                                qk_kv = pl.gather_row(qk_kv, mtp_kv_overlay, [qk_r, 0], [qk_ov, 0], [1, HEAD_DIM])
+                            else:
+                                qk_slot = qk_ridx - (WIN + S)
+                                qk_cblk = pl.cast(pl.read(cmp_block_table, [qk_b, qk_slot // BLOCK_SIZE]), pl.INDEX)
+                                qk_csrc = qk_cblk * BLOCK_SIZE + qk_slot % BLOCK_SIZE
+                                qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_r, 0], [qk_csrc, 0], [1, HEAD_DIM])
+                        else:
+                            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
+                    # Padded lane (qk_k >= TOPK): skip the gather; bias + merge kill it.
 
             # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
             # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
@@ -298,7 +282,7 @@ def sparse_attn_hca(
                 qk_h0 = qk_hb * QK_M_TILE
                 qk_head_row = qk_t * H + qk_h0
                 qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
-                qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
                 qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([QK_M_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
                 qk_mi = pl.row_max(qk_scores)
@@ -307,7 +291,7 @@ def sparse_attn_hca(
                 qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                 qk_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
                 for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
                     qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
                     qk_r0 = qk_sub * H_TILE
@@ -561,7 +545,7 @@ def sparse_attn_test(
     mtp_kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[T, PADDED_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -803,26 +787,27 @@ def build_tensor_specs(
         the pruned build narrows it to `cmp_valid` columns, the full-blocks
         baseline keeps the IDX_TOPK-wide padded tail.
         """
-        win_part = torch.arange(WIN, dtype=torch.int32).unsqueeze(0).expand(T, -1)
-        cmp_width = TOPK - WIN
-        cmp_part = torch.full((T, cmp_width), -1, dtype=torch.int32)
-        cmp_part[:, :cmp_valid] = (torch.arange(cmp_valid, dtype=torch.int32) + WIN + S).unsqueeze(0).expand(T, -1)
-        indices = torch.cat([win_part, cmp_part], dim=-1).contiguous()
+        # ZERO-GATHER layout [T, PADDED_TOPK]: block 0 [0,WIN) = PHYSICAL window page
+        # (slot k -> ring row k), block 1 [WIN,WIN+S) = relocated overlay, block 1 tail
+        # [WIN+S,..) = compressed; the rest stays -1 (padding).
+        indices = torch.full((T, PADDED_TOPK), -1, dtype=torch.int32)
+        indices[:, :WIN] = torch.arange(WIN, dtype=torch.int32)
+        if cmp_valid:
+            indices[:, WIN + S:WIN + S + cmp_valid] = torch.arange(cmp_valid, dtype=torch.int32) + WIN + S
         if short_window_fixture:
             indices[:, :] = -1
-            indices[:, :17] = torch.arange(17, dtype=torch.int32).unsqueeze(0).expand(T, -1)
+            indices[:, :17] = torch.arange(17, dtype=torch.int32)
         if mixed_topk_fixture:
             indices[:, :] = -1
-            indices[:, :17] = torch.arange(17, dtype=torch.int32).unsqueeze(0).expand(T, -1)
+            indices[:, :17] = torch.arange(17, dtype=torch.int32)
             mixed_cmp_valid = min(cmp_valid, IDX_TOPK)
             if mixed_cmp_valid:
-                indices[:, WIN:WIN + mixed_cmp_valid] = (
-                    torch.arange(mixed_cmp_valid, dtype=torch.int32) + WIN + S
-                ).unsqueeze(0).expand(T, -1)
+                indices[:, WIN + S:WIN + S + mixed_cmp_valid] = torch.arange(mixed_cmp_valid, dtype=torch.int32) + WIN + S
         if overlay_replacement_fixture:
             indices[:, :] = -1
-            indices[:, :17] = torch.arange(17, dtype=torch.int32).unsqueeze(0).expand(T, -1)
-            indices[:, 16] = WIN
+            indices[:, :17] = torch.arange(17, dtype=torch.int32)
+            indices[:, 16] = -1     # current-token ring slot: invalid in block 0 (zero-gather page)
+            indices[:, WIN] = WIN   # ...attended instead via the relocated overlay slot WIN+0 in block 1
         if causal_regression_fixture:
             indices[0, WIN - 1] = WIN - 1
         return indices
@@ -861,7 +846,7 @@ def build_tensor_specs(
         TensorSpec("mtp_kv_overlay", [T, HEAD_DIM], torch.bfloat16, init_value=init_mtp_kv_overlay),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("cmp_sparse_indices", [T, TOPK], torch.int32, init_value=init_cmp_sparse_indices),
+        TensorSpec("cmp_sparse_indices", [T, PADDED_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
