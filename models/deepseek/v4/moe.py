@@ -117,7 +117,7 @@ def dispatch(
     # Phase 1: count routes, publish counts, barrier on meta only, then cumsum ->
     # recv_count_out. Earliest recv_count_out can be produced -- it needs every
     # source's counts but none of the bulk payload.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta") as _meta_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta", allow_early_resolve=True) as _meta_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -291,7 +291,7 @@ def combine(
     # cumsum table needed (same shape as dispatch_gather). Each route maps to a unique
     # (dst, loc_e) and a unique r_route, so the blocks and their cross-rank puts are
     # write-disjoint.
-    with pl.spmd(N_LOCAL, name_hint="combine") as _cscatter_tid:
+    with pl.spmd(N_LOCAL, name_hint="combine", allow_early_resolve=True) as _cscatter_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)

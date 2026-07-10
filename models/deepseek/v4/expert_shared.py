@@ -158,7 +158,7 @@ def expert_shared(
             y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
 
         # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.
-        for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="sh_w2_act"):
+        for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="sh_w2_act", allow_early_resolve=True):
             d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
             for dg in pl.pipeline(W2_ACT_INNER, stage=2):
                 d0 = d_base + dg * D_OUT_TILE_ACT

@@ -86,7 +86,7 @@ def expert_routed(
             gate_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
             up_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
 
-            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
+            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm", allow_early_resolve=True):
                 nb_idx = pl.tile.get_block_idx()
                 n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ng in pl.range(MM_GATE_INNER):
@@ -101,7 +101,7 @@ def expert_routed(
                             gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
                     gate_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
 
-            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
+            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm", allow_early_resolve=True):
                 nb_idx = pl.tile.get_block_idx()
                 n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ng in pl.range(MM_GATE_INNER):
@@ -116,7 +116,7 @@ def expert_routed(
                             up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
                     up_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
 
-            with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act"):
+            with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act", allow_early_resolve=True):
                 nb_idx = pl.tile.get_block_idx()
                 n_base = nb_idx * (ACT_GATE_INNER * ACT_INTER_TILE)
                 for ng in pl.pipeline(ACT_GATE_INNER, stage=2):
@@ -141,7 +141,7 @@ def expert_routed(
                     h_tile_fp32[:, n0 : n0 + ACT_INTER_TILE] = gated_masked
 
             h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q", allow_early_resolve=True):
                 eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                 for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
                     eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
@@ -161,7 +161,7 @@ def expert_routed(
                     h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
 
             y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
-            with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm"):
+            with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm", allow_early_resolve=True):
                 wb_idx = pl.tile.get_block_idx()
                 d_base = wb_idx * (W2_INNER * D_OUT_TILE)
                 for dg in pl.range(W2_INNER):
@@ -177,7 +177,7 @@ def expert_routed(
                     y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
 
             recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
-            with pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="exp_w2_act"):
+            with pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="exp_w2_act", allow_early_resolve=True):
                 db_idx = pl.tile.get_block_idx()
                 act_d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
                 w_col_blk = pl.reshape(
