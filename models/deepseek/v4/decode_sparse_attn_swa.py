@@ -46,8 +46,9 @@ ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 
 # tiling
-VALID_TOKEN_TILE = 8
 GATHER_FILL_TILE = 128
+GATHER_SPLITS = 4
+GATHER_ROWS_PER_TASK = WIN // GATHER_SPLITS
 ROPE_OUT_TOK_TILE = 8
 H_TILE = 16
 # qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
@@ -130,8 +131,8 @@ PB_ACT_TBLKS = T // PROJ_B_ACT_TBLK
 NEG_INF = -1.0e20
 CACHE_INSERT_BLOCKS = 1
 
-assert T % VALID_TOKEN_TILE == 0
 assert T % 2 == 0
+assert WIN % GATHER_SPLITS == 0
 assert H % 4 == 0
 assert QK_M_TILE % H_TILE == 0
 assert H % QK_M_TILE == 0
@@ -163,7 +164,7 @@ def sparse_attn_swa(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv_flat: pl.Tensor[[ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    swa_lens: pl.Tensor[[T], pl.INT32],
+    sparse_bias: pl.Tensor[[T, PADDED_TOPK], pl.FP32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -176,24 +177,17 @@ def sparse_attn_swa(
     # SWA metadata already lowered each logical window row to a physical cache
     # slot. Current decode tokens must be inserted into ori_kv by the caller
     # before this function runs; there is no MTP overlay path here.
-    sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
-    for vb_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="swa_valid_bias"):
-        vb = vb_blk * VALID_TOKEN_TILE
-        v_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
-        v_col_m = pl.col_expand(pl.full([VALID_TOKEN_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), v_col)
-        v_lens = pl.cast(pl.reshape(swa_lens[vb : vb + VALID_TOKEN_TILE], [VALID_TOKEN_TILE, 1]), target_type=pl.FP32)
-        v_valid = pl.minimum(
-            pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0),
-            1.0,
-        )
-        sparse_bias[vb : vb + VALID_TOKEN_TILE, 0 : ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
 
     swa_kv_flat = pl.create_tensor([T * WIN, HEAD_DIM], dtype=pl.BF16)
     gather_tids = pl.array.create(1, pl.TASK_ID)
-    with pl.spmd(T, name_hint="swa_gather_kv") as gather_tid:
-        g_t = pl.tile.get_block_idx()
+    with pl.spmd(T * GATHER_SPLITS, name_hint="swa_gather_kv") as gather_tid:
+        g_task = pl.tile.get_block_idx()
+        g_t = g_task // GATHER_SPLITS
+        g_split = g_task - g_t * GATHER_SPLITS
+        g_r0 = g_split * GATHER_ROWS_PER_TASK
         g_base = g_t * WIN
-        for g_r in pl.range(WIN):
+        for g_dr in pl.range(GATHER_ROWS_PER_TASK):
+            g_r = g_r0 + g_dr
             g_slot_i32 = pl.read(swa_indices, [g_t, g_r])
             g_dst = g_base + g_r
             if g_slot_i32 >= 0:
@@ -212,7 +206,7 @@ def sparse_attn_swa(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]]) as qk_tid:
+    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]], allow_early_resolve=True) as qk_tid:
         qk_t = pl.tile.get_block_idx()
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
@@ -260,21 +254,22 @@ def sparse_attn_swa(
     # so it overlaps it and is off merge_norm's critical path.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs"):
-        cp_r0 = cp * ROPE_TILE
-        cp_c0 = 2 * cp_r0
-        cs_col = pl.col_expand_mul(
-            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
-        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
-        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
-            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs"):
+        for cp in pl.range(HALF_ROPE // ROPE_TILE):
+            cp_r0 = cp * ROPE_TILE
+            cp_c0 = 2 * cp_r0
+            cs_col = pl.col_expand_mul(
+                pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
+                pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
+            cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
+            cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
+            cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
+            cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+            cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+            rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+            rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
+                pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
 
     # Online-softmax merge across sparse-K tiles, sink-norm, then fused inverse RoPE.
     # One spmd block per (token, head-tile) -- T*(H//H_TILE) blocks -- so the merge
@@ -284,7 +279,7 @@ def sparse_attn_swa(
     # segment is rotated in UB and packed straight into o_packed's rope columns.
     # with-form spmd so the dispatch TaskId (merge_tid) can be an explicit dep of
     # the manual-scope proj_a tasks below (which read merge_norm's o_packed cols).
-    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm") as merge_tid:
+    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", allow_early_resolve=True) as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H // H_TILE)
         m_h_idx = m_idx - m_t * (H // H_TILE)
@@ -498,11 +493,21 @@ def sparse_attn_test(
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
+        v_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
+        v_col_m = pl.col_expand(pl.full([T, ATTN_K_TILE], dtype=pl.FP32, value=0.0), v_col)
+        v_lens = pl.cast(pl.reshape(swa_lens[0:T], [T, 1]), target_type=pl.FP32)
+        v_valid = pl.minimum(
+            pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0),
+            1.0,
+        )
+        sparse_bias[0:T, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     sparse_attn_swa(
         q,
         ori_kv_flat,
         swa_indices,
-        swa_lens,
+        sparse_bias,
         attn_sink,
         freqs_cos,
         freqs_sin,
