@@ -288,26 +288,9 @@ ROPE_CORES = 32
 ROPE_ITEMS_PER_CORE = (NUM_KV_HEADS * BATCH) // ROPE_CORES
 assert (NUM_KV_HEADS * BATCH) % ROPE_CORES == 0
 
-# Fused rope_qkv dependency layout: rope (QK-norm + RoPE) reads ALL of q/k/v_proj +
-# inv_rms_states, so it gates on every q/k/v projection tile writer plus rms_tid,
-# gathered into one TASK_ID array (rope_dep_tids). Offsets must be module-level Python
-# ints (in-function int locals get traced as Scalars, which pl.array.create rejects).
-K_TID_BASE = Q_ON * QKV_OK  # 50 — q tiles occupy [0, K_TID_BASE)
-V_TID_BASE = K_TID_BASE + KV_ON * QKV_OK  # 60 — k tiles in [K_TID_BASE, V_TID_BASE)
-RMS_TID_IDX = V_TID_BASE + KV_ON * QKV_OK  # 70 — v tiles in [V_TID_BASE, RMS_TID_IDX); rms_tid last
-ROPE_NDEPS = RMS_TID_IDX + 1  # 71
-WORK_TID_IDX = ROPE_NDEPS  # 71 — fa_work_build (fa_total block count); fa_fused folds rope in as phase 0
-# MLP/out accumulator-seed slots appended to the SAME rope_dep_tids array (deps= must
-# be one comprehension, not a mix). fa_fused gates on the 4 zero-fill seeds so the
-# ~305 downstream atomic-add tasks (out/gate/up/down_proj) can DROP their direct seed
-# edge — ordering stays correct transitively (seed -> fa_fused -> atomic-add), cutting
-# task-graph edges (AICPU dep-processing load). The seeds only dep on the prev layer,
-# so they finish long before fa_fused's rope chain — no critical-path delay.
-DOWN_SEED_IDX = WORK_TID_IDX + 1  # 72
-GATE_SEED_IDX = WORK_TID_IDX + 2  # 73
-UP_SEED_IDX = WORK_TID_IDX + 3  # 74
-OUT_SEED_IDX = WORK_TID_IDX + 4  # 75
-FA_NDEPS = OUT_SEED_IDX + 1  # 76 — rope deps + work_tid + 4 accumulator seeds
+# Q/K/V projections and the merged accumulator seed are each SPMD/AT dispatches:
+# every one produces exactly one TASK_ID. fa_fused depends on those Scalars directly;
+# repeating a SPMD task-id per output tile adds duplicate graph edges only.
 
 # Fused QK-norm reduction alignment. The per-(KV head, batch) sum-of-squares emits a
 # col-major [rows, 1] tile; ptoas requires its column byte size (rows * sizeof(FP32))
@@ -413,13 +396,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     normed_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
     next_gamma_idx: pl.Scalar[pl.INT32],  # clamped min(layer_idx+1, N-1) for dcr_xgamma's gamma
-    # Cross-iteration carries: prev_out_tids = DOWN_ON slab writers of `hidden_states`
-    # (prev dcr / copy_hidden) — gate rms_recip / residual / seeds. prev_normed_tids =
-    # DOWN_ON slab writers of `normed_in` (prev dcr_xgamma / x_gamma_0) — gate QKV. Both
-    # refilled by this layer's dcr_xgamma (same task writes out + normed_out).
-    prev_out_tids: pl.Array[DOWN_ON, pl.TASK_ID],
-    prev_normed_tids: pl.Array[DOWN_ON, pl.TASK_ID],
-) -> pl.Tensor[[BATCH, HIDDEN], pl.FP32]:
+    # prev_normed_tid gates Q, KV seed, RMS, and accumulator seed.  For layer
+    # 0 it is x_gamma0 (which follows copy_hidden); for later layers it is the
+    # previous dcr_xgamma.  Both carries are Scalar TASK_IDs because their
+    # producers are SPMD dispatches.
+    prev_normed_tid: pl.Scalar[pl.TASK_ID],
+) -> tuple[pl.Tensor[[BATCH, HIDDEN], pl.FP32], pl.Scalar[pl.TASK_ID]]:
     # Per-layer offsets into the STACKED weights / PAGED KV cache. decode_fwd passes
     # the running loop index 0.._FWD_NLAYERS-1; decode_fwd_layers passes
     # 0.._CHUNK_NLAYERS-1 (per-chunk weight slices).
@@ -444,11 +426,6 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # (deps=[down_tids[k] for k in range(DOWN_ON * K_SPLITS)] — list-comprehension
     # per-index fence works for large N; whole-array deps=[down_tids] does not).
     down_tids = pl.array.create(DOWN_ON * K_SPLITS, pl.TASK_ID)
-    # The fused rope_qkv (QK-norm + RoPE) gates on ALL q/k/v projection tile writers
-    # plus rms_tid, collected in ONE TASK_ID array so the spmd deps= can be a single
-    # comprehension (the frontend requires deps to be one list/tuple/comprehension, not
-    # a concatenation). Layout (offsets module-level): [q tiles | k tiles | v tiles | rms_tid].
-    rope_dep_tids = pl.array.create(FA_NDEPS, pl.TASK_ID)
     inv_rms_states = pl.create_tensor([BATCH, 1], dtype=pl.FP32)  # deferred 1/rms denominator
     q_proj = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     k_proj = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
@@ -466,7 +443,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     #
     # WHOLE-LAYER manual scope (x_gamma .. rope): tensormap registration is
     # suppressed; every cross-task edge below is an explicit deps=. x_gamma slab
-    # n deps ONLY on prev_out_tids[n] (the previous layer's dcr writer of that
+    # n depends on prev_out_tid (the previous layer's dcr writer of every
     # carry slab, copy_hidden for layer 0) — the fine-grained dcr->x_gamma edge
     # the auto path cannot express without whole-parent WAW serialization.
     # normed_in is now the `normed_in` PARAM (produced by prev dcr_xgamma / x_gamma_0).
@@ -497,16 +474,21 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         # dependency on the previous dcr_xgamma task while still not bumping
         # dispatch_fanin via early resolve.
         seed_dummy = pl.system.task_dummy(deps=[])
-        prev_out_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
-        for _dep_i in pl.unroll(DOWN_ON):
-            prev_out_seed_deps[_dep_i] = prev_out_tids[_dep_i]
-        prev_out_seed_deps[DOWN_ON] = seed_dummy
+        prev_normed_seed_deps = pl.array.create(2, pl.TASK_ID)
+        prev_normed_seed_deps[0] = prev_normed_tid
+        prev_normed_seed_deps[1] = seed_dummy
+        # K/V consume normed_in.  This makes the layer-0 x_gamma0 dispatch
+        # precede kv_seed (and therefore K/V), while later layers receive the
+        # same ordering from dcr_xgamma through prev_normed_tid.
+        prev_normed_kv_seed_deps = pl.array.create(2, pl.TASK_ID)
+        prev_normed_kv_seed_deps[0] = prev_normed_tid
+        prev_normed_kv_seed_deps[1] = seed_dummy
 
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="rms_recip",
             allow_early_resolve=True,
-            deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)],
+            deps=[prev_normed_seed_deps[i] for i in range(2)],
         ) as rms_tid:
             partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
             for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
@@ -519,23 +501,22 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
             inv_rms_states = pl.assemble(inv_rms_states, inv_rms, [0, 0])
-        rope_dep_tids[RMS_TID_IDX] = rms_tid  # fused rope reads inv_rms_states
-
         # ── Scope 1: Q projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_seed", allow_early_resolve=True) as q_seed_tid:
             for snb in pl.pipeline(Q_ON, stage=2):
                 q_proj = pl.assemble(
                     q_proj, pl.full([BATCH, QKV_N_TILE], dtype=pl.FP32, value=0.0), [0, snb * QKV_N_TILE]
                 )
-        prev_normed_q_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
-        for _dep_i in pl.unroll(DOWN_ON):
-            prev_normed_q_seed_deps[_dep_i] = prev_normed_tids[_dep_i]
-        prev_normed_q_seed_deps[DOWN_ON] = q_seed_tid
+
+        prev_normed_q_deps = pl.array.create(2, pl.TASK_ID)
+        prev_normed_q_deps[0] = prev_normed_tid
+        prev_normed_q_deps[1] = q_seed_tid
+
         with pl.spmd(
             Q_ON * QKV_OK,
             name_hint="q_proj",
             allow_early_resolve=True,
-            deps=[prev_normed_q_seed_deps[i] for i in range(DOWN_ON + 1)],
+            deps=[prev_normed_q_deps[i] for i in range(2)],
         ) as q_proj_tid:
             q_blk = pl.get_block_idx()
             q_nt = q_blk // QKV_OK
@@ -555,25 +536,27 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                         q_acc, normed_in[:, kk : kk + TK], wq[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
                     )
                 q_proj = pl.assemble(q_proj, q_acc, [0, n0], atomic=pl.AtomicType.Add)
-        for _i in pl.unroll(Q_ON * QKV_OK):
-            rope_dep_tids[_i] = q_proj_tid
-
         # ── KV seed: zero k_proj + v_proj buffers. ──
         # ── KV seed: zeroed via seed_dummy barrier (see comment above). ──
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_seed", deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)]) as kv_seed_tid:
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="kv_seed",
+            deps=[prev_normed_kv_seed_deps[i] for i in range(2)],
+        ) as kv_seed_tid:
             k_proj = pl.assemble(k_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
             v_proj = pl.assemble(v_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
-        prev_normed_kv_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
-        for _dep_i in pl.unroll(DOWN_ON):
-            prev_normed_kv_seed_deps[_dep_i] = prev_normed_tids[_dep_i]
-        prev_normed_kv_seed_deps[DOWN_ON] = kv_seed_tid
 
         # ── MLP/out seed: zero down/gate/up/out accumulators. ──
         down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
         gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_out_seed", allow_early_resolve=True, deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)]) as mlp_out_seed_tid:
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="mlp_out_seed",
+            allow_early_resolve=True,
+            deps=[prev_normed_seed_deps[i] for i in range(2)],
+        ) as mlp_out_seed_tid:
             for nb in pl.pipeline(DOWN_ON, stage=2):
                 n0 = nb * DOWN_TN
                 zero = pl.full([BATCH, DOWN_TN], dtype=pl.FP32, value=0.0)
@@ -590,17 +573,15 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 out_seed_n0 = nb * OUT_TN
                 out_zero = pl.full([BATCH, OUT_TN], dtype=pl.FP32, value=0.0)
                 attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_zero, [0, out_seed_n0])
-        rope_dep_tids[DOWN_SEED_IDX] = mlp_out_seed_tid
-        rope_dep_tids[GATE_SEED_IDX] = mlp_out_seed_tid
-        rope_dep_tids[UP_SEED_IDX] = mlp_out_seed_tid
-        rope_dep_tids[OUT_SEED_IDX] = mlp_out_seed_tid
-
         # ── Scope 1: K projection — SPMD split-K + inner N/K tiling. ──
         with pl.spmd(
             KV_ON * QKV_OK,
             name_hint="k_proj",
             allow_early_resolve=True,
-            deps=[prev_normed_kv_seed_deps[i] for i in range(DOWN_ON + 1)],
+            # kv_seed already waits for x_gamma0 / the previous dcr_xgamma via
+            # prev_normed_tid. Keeping K behind that seed avoids a redundant
+            # direct predecessor edge.
+            deps=[kv_seed_tid],
         ) as k_proj_tid:
             k_blk = pl.get_block_idx()
             k_nt = k_blk // QKV_OK
@@ -620,15 +601,13 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                         k_acc, normed_in[:, kk : kk + TK], wk[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
                     )
                 k_proj = pl.assemble(k_proj, k_acc, [0, n0], atomic=pl.AtomicType.Add)
-        for _i in pl.unroll(KV_ON * QKV_OK):
-            rope_dep_tids[K_TID_BASE + _i] = k_proj_tid
-
         # ── Scope 1: V projection — SPMD split-K + inner N/K tiling. ──
         with pl.spmd(
             KV_ON * QKV_OK,
             name_hint="v_proj",
             allow_early_resolve=True,
-            deps=[prev_normed_kv_seed_deps[i] for i in range(DOWN_ON + 1)],
+            # Same transitive x_gamma0 / dcr_xgamma dependency as k_proj.
+            deps=[kv_seed_tid],
         ) as v_proj_tid:
             v_blk = pl.get_block_idx()
             v_nt = v_blk // QKV_OK
@@ -648,9 +627,6 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                         v_acc, normed_in[:, kk : kk + TK], wv[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
                     )
                 v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
-        for _i in pl.unroll(KV_ON * QKV_OK):
-            rope_dep_tids[V_TID_BASE + _i] = v_proj_tid
-
         # ── Scope 2 prep: build the dense block-level work list on an AIV task. ──
         # Inputs are external (seq_lens) — no deps.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="fa_work_build", allow_early_resolve=True) as work_tid:
@@ -666,8 +642,6 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     )
                 cursor = cursor + wb_ctx
             pl.tensor.write(fa_total, [0, 0], pl.cast(cursor, target_type=pl.INT32))
-
-        rope_dep_tids[WORK_TID_IDX] = work_tid  # fa_fused (now folds in rope) also waits on fa_work_build
 
         # fa_fused: ONE mixed cube+vec root (QK -> softmax -> SV), BLOCK-LEVEL dense
         # static dispatch. Each grid-stride step processes exactly ONE real seq-block
@@ -686,7 +660,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             # NONE region (both lanes, disjoint (b, kvh) work). A function-level pl.split
             # cannot express this — it would also try to halve phase-2's un-halvable
             # [5, 128] / [1, 640] reduction tiles ("even split dimension").
-            deps=[rope_dep_tids[i] for i in range(FA_NDEPS)],  # rope deps + work_tid + 4 accumulator seeds (funnel; see *_SEED_IDX)
+            deps=[q_proj_tid, k_proj_tid, v_proj_tid, rms_tid, work_tid, mlp_out_seed_tid],
         ) as attn_done_tid:  # now also runs phase-2 softmax (writes attn_out) after the syncall
             fa_core = pl.get_block_idx()
             # ── Phase 0: QK-norm + RoPE, folded in (was the standalone rope_qkv grid).
@@ -1191,15 +1165,34 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         gamma_next = pl.slice(input_rms_weight, [1, DOWN_TN], [next_gamma_idx, n0])
         xg = pl.col_expand_mul(out_chunk, gamma_next)
         normed_out = pl.assemble(normed_out, pl.cast(xg, target_type=pl.BF16), [0, n0])
-    # One spmd dispatch tid carries BOTH out + normed_out for all DOWN_ON slabs (the
-    # per-block tids of the old pl.parallel form are gone): the next layer's rms_recip
-    # / seeds (read prev_out_tids[*]) and QKV (read prev_normed_tids[*]) all wait on
-    # the single dcr dispatch. Fill every slab slot so the DOWN_ON-wide carry (sized
-    # for copy_hidden's layer-0 seed) stays valid.
-    for _slab in pl.unroll(DOWN_ON):
-        prev_out_tids[_slab] = dcr_tid
-        prev_normed_tids[_slab] = dcr_tid
-    return out
+    # One SPMD dispatch tid carries BOTH out + normed_out for all DOWN_ON slabs.
+    return out, dcr_tid
+
+
+@pl.jit.inline
+def _x_gamma0_task_inline(
+    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.FP32],
+    input_rms_weight: pl.Tensor,
+    normed: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    prev_out_tid: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Write layer 0's normed input and return the SPMD completion id."""
+    xgamma_deps = pl.array.create(1, pl.TASK_ID)
+    xgamma_deps[0] = prev_out_tid
+    with pl.spmd(
+        XG_BLOCKS,
+        name_hint="x_gamma0",
+        allow_early_resolve=True,
+        deps=[xgamma_deps[i] for i in range(1)],
+    ) as xgamma_tid:
+        xg_k0 = pl.tile.get_block_idx() * (HIDDEN // XG_BLOCKS)
+        for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK // XG_BLOCKS, stage=2):
+            k0 = xg_k0 + kb * RMSNORM_K_CHUNK
+            x_chunk = hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK]
+            gamma = pl.slice(input_rms_weight, [1, RMSNORM_K_CHUNK], [0, k0])
+            xg = pl.col_expand_mul(x_chunk, gamma)
+            normed = pl.assemble(normed, pl.cast(xg, target_type=pl.BF16), [0, k0])
+    return xgamma_tid
 
 
 @pl.jit.inline
@@ -1351,11 +1344,11 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     next_hidden = _token_embed_inline(sampled_ids_in, embed_weight, next_hidden)
 
     cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 inter-layer carry (was BF16)
-    # Cross-iteration carry-writer tids (see _decode_layer's prev_out_tids):
-    # seeded with copy_hidden for layer 0, refilled per layer by the dcr writers.
-    carry_tids = pl.array.create(DOWN_ON, pl.TASK_ID)
+    # Carry the single copy_hidden task id out of pl.parallel as a Scalar.  The
+    # dummy is only the loop's initial value; this fixed-size loop overwrites it.
+    prev_out_tid = pl.system.task_dummy(deps=[])
     for cb0 in pl.parallel(0, BATCH, BATCH):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden") as ch_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden", allow_early_resolve=True) as ch_tid:
             for ckb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
                 ck0 = ckb * RMSNORM_K_CHUNK
                 # FIRST-layer boundary: cast the external BF16 embed input -> FP32 once,
@@ -1368,37 +1361,22 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
                     ),
                     [cb0, ck0],
                 )
-        for cseed in pl.range(DOWN_ON):
-            carry_tids[cseed] = ch_tid
+        prev_out_tid = ch_tid
 
     # ── Pre-loop x_gamma_0: layer 0's normed = cur_0 * gamma_0 (BF16). For layers 1+,
     # the per-layer normed is produced by the PREVIOUS layer's fused dcr_xgamma; only
     # layer 0 (whose cur comes from copy_hidden, not a dcr) needs this standalone task.
     normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    carry_normed_tids = pl.array.create(DOWN_ON, pl.TASK_ID)
-    with pl.manual_scope():
-        for xg_n in pl.range(XG_BLOCKS):
-            xg_k0 = xg_n * (HIDDEN // XG_BLOCKS)
-            with pl.at(
-                level=pl.Level.CORE_GROUP, name_hint="x_gamma0", deps=[carry_tids[xg_n]]
-            ) as xg0_tid:
-                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK // XG_BLOCKS, stage=2):
-                    k0 = xg_k0 + kb * RMSNORM_K_CHUNK
-                    x_chunk = cur[:, k0 : k0 + RMSNORM_K_CHUNK]  # FP32 carry
-                    gamma = pl.slice(input_rms_weight, [1, RMSNORM_K_CHUNK], [0, k0])
-                    xg = pl.col_expand_mul(x_chunk, gamma)
-                    normed = pl.assemble(normed, pl.cast(xg, target_type=pl.BF16), [0, k0])
-            carry_normed_tids[xg_n] = xg0_tid
-
+    prev_normed_tid = _x_gamma0_task_inline(cur, input_rms_weight, normed, prev_out_tid)
     for layer_idx in pl.range(_FWD_NLAYERS):
         layer_next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 layer output
         next_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # next layer's x*gamma
         next_gamma_idx = pl.min(layer_idx + 1, _FWD_NLAYERS - 1)  # clamp: last layer's normed unused
-        cur = _decode_layer(
+        cur, prev_normed_tid = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
             seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
             post_rms_weight, layer_next_hidden, normed, next_normed, layer_idx, next_gamma_idx,
-            carry_tids, carry_normed_tids,
+            prev_normed_tid,
         )
         normed = next_normed
     out = rms_lm_head_fp32(cur, final_norm_weight, lm_head_weight, seq_lens, out)
@@ -1445,7 +1423,9 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
     # mirroring decode_fwd's embed-in / lm-head-in casts. (Without these the BF16 cur
     # hits _decode_layer's FP32 x_gamma/rms_recip -> ptoas bfloat16 type error.)
     cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-    carry_tids = pl.array.create(DOWN_ON, pl.TASK_ID)
+    # Carry the single copy_hidden task id out of pl.parallel as a Scalar.  The
+    # dummy is only the loop's initial value; this fixed-size loop overwrites it.
+    prev_out_tid = pl.system.task_dummy(deps=[])
     for cb0 in pl.parallel(0, BATCH, BATCH):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden") as ch_tid:
             for ckb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
@@ -1458,35 +1438,20 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
                     ),
                     [cb0, ck0],
                 )
-        for cseed in pl.range(DOWN_ON):
-            carry_tids[cseed] = ch_tid
+        prev_out_tid = ch_tid
 
     # Pre-loop x_gamma_0: chunk layer 0's normed = cur * gamma_0 (mirrors decode_fwd).
     normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    carry_normed_tids = pl.array.create(DOWN_ON, pl.TASK_ID)
-    with pl.manual_scope():
-        for xg_n in pl.range(XG_BLOCKS):
-            xg_k0 = xg_n * (HIDDEN // XG_BLOCKS)
-            with pl.at(
-                level=pl.Level.CORE_GROUP, name_hint="x_gamma0", deps=[carry_tids[xg_n]]
-            ) as xg0_tid:
-                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK // XG_BLOCKS, stage=2):
-                    k0 = xg_k0 + kb * RMSNORM_K_CHUNK
-                    x_chunk = cur[:, k0 : k0 + RMSNORM_K_CHUNK]
-                    gamma = pl.slice(input_rms_weight, [1, RMSNORM_K_CHUNK], [0, k0])
-                    xg = pl.col_expand_mul(x_chunk, gamma)
-                    normed = pl.assemble(normed, pl.cast(xg, target_type=pl.BF16), [0, k0])
-            carry_normed_tids[xg_n] = xg0_tid
-
+    prev_normed_tid = _x_gamma0_task_inline(cur, input_rms_weight, normed, prev_out_tid)
     for i in pl.range(_CHUNK_NLAYERS):
         next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
         next_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         next_gamma_idx = pl.min(i + 1, _CHUNK_NLAYERS - 1)
-        cur = _decode_layer(
+        cur, prev_normed_tid = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
             seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
             post_rms_weight, next_hidden, normed, next_normed, i, next_gamma_idx,
-            carry_tids, carry_normed_tids,
+            prev_normed_tid,
         )
         normed = next_normed
     for ob0 in pl.parallel(0, BATCH, BATCH):
