@@ -473,7 +473,6 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         with pl.spmd(
             ROPE_CORES,
             name_hint="rope_qkv",
-            allow_early_resolve=True,
             deps=[q_proj_tid, k_proj_tid, v_proj_tid, rms_tid],
         ) as rope_tid:
             rope_core = pl.get_block_idx()
@@ -1200,7 +1199,7 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
             XG_BLOCKS,
             name_hint="x_gamma0",
             allow_early_resolve=True,
-            deps=[prev_out_tid[i] for i in range(1)],
+            deps=[prev_out_tid[0]],
         ) as xgamma_tid:
             xg_k0 = pl.tile.get_block_idx() * (HIDDEN // XG_BLOCKS)
             for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK // XG_BLOCKS, stage=2):
