@@ -67,10 +67,13 @@ METADATA_PREFIX_BYTES = KV_LENGTHS_OFFSET + BATCH * 8
 BARRIER_SLOT_BYTES = 512
 BARRIER_PHYSICAL_LANES = DEFAULT_BLOCK_DIM * 2
 ROPE_READY_SLOT_BYTES = 32
+# AIV lanes that soft-barrier after the fused rope prologue (DEFAULT_BLOCK_DIM * 2 = 48).
+# Args-based indexing (get_block_idx*2 + get_sub_block_id); the hardware get_subblockdim()
+# is 0 in this launch, so pto::SYNCALL's builtin participant model cannot be used.
 ROPE_READY_PHYSICAL_LANES = DEFAULT_BLOCK_DIM * 2
 # The CCE wrapper aligns the barrier start at runtime, so reserve one slot of
 # alignment slack before the maximum 48 single-writer barrier slots. The
-# producer-only RoPE-ready soft-barrier region follows the aligned FAI barrier.
+# AIV RoPE-ready soft-barrier region follows the aligned FAI barrier.
 METADATA_BYTES = (
     (
         METADATA_PREFIX_BYTES

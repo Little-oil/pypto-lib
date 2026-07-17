@@ -38,34 +38,46 @@ static __aicore__ __attribute__((always_inline)) __gm__ int32_t *qwen_fai_barrie
     return reinterpret_cast<__gm__ int32_t *>(aligned_barrier);
 }
 
-// AIV lanes finish the rope GM writes, barrier among themselves over the rope-ready
-// metadata slots, then one sub-lane per AIC pair signals its AIC. The AIC waits for
-// that flag before starting attention (which reads the rope-produced q/k/v cache).
-// CrossCoreSetFlag uses PIPE_MTE3 so the signal fires only after rope's UB->GM
-// stores have flushed — the cross-pipe GM visibility that a plain SYNCALL<Mix> lacks.
+// After the AIV prologue writes q/k/v to GM, synchronize so the AIC attention does
+// not read them early. The 48 AIV lanes soft-barrier among themselves over the
+// rope-ready slots; each AIC polls those slots until all 48 are non-zero.
+// Indexing is args-based (get_block_idx*2 + get_sub_block_id): the hardware
+// get_subblockdim() reads 0 in this pypto launch (the dispatch does not set the
+// subblockdim register), so pto::SYNCALL's builtin participant model
+// (SYNCALL_GET_MIX_PARTICIPANT_*) cannot be used — it under-counts (24 not 72) and
+// collides the AIV indices, deadlocking. The vendor attention uses the same
+// args-based getters, so this matches its view of the topology. The soft barrier's
+// DCCI + dsb(DSB_DDR) gives the cross-core GM visibility the AIC needs.
 static __aicore__ __attribute__((always_inline)) void sync_qwen_rope_producers(
     __gm__ int64_t *args,
     __gm__ int32_t *fai_barrier
 ) {
-    pipe_barrier(PIPE_ALL);
-#if defined(__DAV_CUBE__)
-    AscendC::CrossCoreWaitFlag(qwen_fai_metadata::kRopeReadyCrossCoreFlag);
-#elif defined(__DAV_VEC__)
     __gm__ int32_t *ready = reinterpret_cast<__gm__ int32_t *>(
         reinterpret_cast<__gm__ uint8_t *>(fai_barrier) + qwen_fai_metadata::kBarrierBytes
     );
-    uint32_t physical_lane = static_cast<uint32_t>(get_block_idx(args)) * 2 +
-                             static_cast<uint32_t>(get_sub_block_id(args));
-    __ubuf__ int32_t *ub_workspace = reinterpret_cast<__ubuf__ int32_t *>(0x3000);
-    pto::SYNCALL_SOFT_AIV_BARRIER(
-        ready,
-        ub_workspace,
-        qwen_fai_metadata::kRopeReadySlotCount,
-        physical_lane
-    );
-    if (get_sub_block_id(args) == 0) {
-        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(qwen_fai_metadata::kRopeReadyCrossCoreFlag);
+    pipe_barrier(PIPE_ALL);
+#if defined(__DAV_CUBE__)
+    while (true) {
+        uint32_t ready_count = 0;
+        for (uint32_t i = 0; i < qwen_fai_metadata::kRopeReadySlotCount; ++i) {
+            __gm__ int32_t *slot = ready + i * qwen_fai_metadata::kRopeReadySlotWords;
+            dcci(reinterpret_cast<__gm__ void *>(slot), SINGLE_CACHE_LINE);
+            dsb(DSB_DDR);
+            if (slot[0] != 0) {
+                ++ready_count;
+            }
+        }
+        pipe_barrier(PIPE_ALL);
+        if (ready_count >= qwen_fai_metadata::kRopeReadySlotCount) {
+            break;
+        }
     }
+#elif defined(__DAV_VEC__)
+    uint32_t aiv_idx = static_cast<uint32_t>(get_block_idx(args)) * 2 +
+                       static_cast<uint32_t>(get_sub_block_id(args));
+    pto::SYNCALL_SOFT_AIV_BARRIER(ready, reinterpret_cast<__ubuf__ int32_t *>(0x3000),
+                                  static_cast<int32_t>(qwen_fai_metadata::kRopeReadySlotCount),
+                                  static_cast<int32_t>(aiv_idx));
 #endif
     pipe_barrier(PIPE_ALL);
 }
