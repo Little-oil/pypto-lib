@@ -35,6 +35,31 @@
 
 constexpr uint64_t kQwenFaiHeadDim = 128;
 
+// Arg indices into the kernel args[] array, switched by QWEN_FAI_ATTENTION_ONLY_ABI.
+// The standalone attention extern passes (query, k/v_cache, block_table, out,
+// workspace, metadata, cache_row_offset) at 0..7. The fused extern prepends the rope
+// inputs (q_proj..rope_sin at 0..9, block_table 10), so the attention tensors shift
+// to 11..17 (out first — it is the extern return / first writable).
+#ifdef QWEN_FAI_ATTENTION_ONLY_ABI
+constexpr int32_t kQueryArg = 0;
+constexpr int32_t kKeyCacheArg = 1;
+constexpr int32_t kValueCacheArg = 2;
+constexpr int32_t kBlockTableArg = 3;
+constexpr int32_t kOutArg = 4;
+constexpr int32_t kWorkspaceArg = 5;
+constexpr int32_t kMetadataArg = 6;
+constexpr int32_t kCacheRowOffsetArg = 7;
+#else
+constexpr int32_t kQueryArg = 12;
+constexpr int32_t kKeyCacheArg = 13;
+constexpr int32_t kValueCacheArg = 14;
+constexpr int32_t kBlockTableArg = 10;
+constexpr int32_t kOutArg = 11;
+constexpr int32_t kWorkspaceArg = 15;
+constexpr int32_t kMetadataArg = 16;
+constexpr int32_t kCacheRowOffsetArg = 17;
+#endif
+
 static __aicore__ __attribute__((always_inline)) void acquire_qwen_fai_metadata(GM_ADDR metadata) {
     uint64_t first_line = reinterpret_cast<uint64_t>(metadata) &
                           ~(static_cast<uint64_t>(qwen_fai_metadata::kDcciLineBytes) - 1);
@@ -125,24 +150,24 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
         FaiKernel::MaskType::NO_MASK, FaiKernel::inputLayout::TND>;
     using Kernel = std::conditional_t<IsFlashDecode, FdKernel, NonFdKernel>;
 
-    GM_ADDR metadata = tensor_data<uint8_t>(args, 6);
-    uint64_t cache_row_offset = static_cast<uint64_t>(args[7]);
+    GM_ADDR metadata = tensor_data<uint8_t>(args, kMetadataArg);
+    uint64_t cache_row_offset = static_cast<uint64_t>(args[kCacheRowOffsetArg]);
     uint64_t cache_byte_offset = cache_row_offset * kQwenFaiHeadDim * sizeof(uint16_t);
-    GM_ADDR key = tensor_data<uint16_t>(args, 1) + cache_byte_offset;
-    GM_ADDR value = tensor_data<uint16_t>(args, 2) + cache_byte_offset;
+    GM_ADDR key = tensor_data<uint16_t>(args, kKeyCacheArg) + cache_byte_offset;
+    GM_ADDR value = tensor_data<uint16_t>(args, kValueCacheArg) + cache_byte_offset;
 
     FAIKernelParams params{
-        tensor_data<uint16_t>(args, 0),
+        tensor_data<uint16_t>(args, kQueryArg),
         key,
         value,
         nullptr,
         nullptr,
-        tensor_data<int32_t>(args, 3),
+        tensor_data<int32_t>(args, kBlockTableArg),
         metadata + qwen_fai_metadata::kCumulativeQOffset,
         metadata + qwen_fai_metadata::kKvLengthsOffset,
-        tensor_data<uint16_t>(args, 4),
+        tensor_data<uint16_t>(args, kOutArg),
         nullptr,
-        tensor_data<uint8_t>(args, 5),
+        tensor_data<uint8_t>(args, kWorkspaceArg),
         metadata + qwen_fai_metadata::kTilingOffset,
         nullptr
     };
@@ -159,11 +184,12 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// rope_qkv producer (Stage 1: validated in isolation via the rope_only entry).
-// Gated so the attention path (which does not define QWEN_FAI_ROPE_ONLY_ABI) is
-// untouched. Mirrors decode_fwd.py:471-590 (the standalone rope_qkv SPMD task).
+// rope_qkv producer. Compiled for both the fused attention entry (AIV runs rope,
+// then cross-core-syncs the AIC attention) and the rope_only isolation entry; the
+// standalone attention_only entry defines QWEN_FAI_ATTENTION_ONLY_ABI to skip it.
+// On the AIC (cube) variant run_qwen_rope_qkv is a no-op (rope is vector-only).
 // ══════════════════════════════════════════════════════════════════════════════
-#ifdef QWEN_FAI_ROPE_ONLY_ABI
+#ifndef QWEN_FAI_ATTENTION_ONLY_ABI
 #include "kernel_operator.h"
 
 // rope runs on AIV lanes only; on the AIC variant of the mixed extern every symbol
@@ -171,7 +197,7 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
 // run_qwen_rope_qkv stays declared for both core types (cube gets the no-op stub).
 #ifdef __DAV_C220_VEC__
 
-// Arg indices for the rope_only extern ABI (paged_attention_rope_only_cce).
+// Rope input args (shared by rope_only and the fused extern): q_proj..rope_sin at 0..9.
 constexpr int32_t kRopeQProjArg = 0;
 constexpr int32_t kRopeKProjArg = 1;
 constexpr int32_t kRopeVProjArg = 2;
@@ -182,10 +208,19 @@ constexpr int32_t kRopeSeqLensArg = 6;
 constexpr int32_t kRopeSlotMappingArg = 7;
 constexpr int32_t kRopeCosArg = 8;
 constexpr int32_t kRopeSinArg = 9;
+// Rope output args differ by ABI: rope_only packs them right after sin (10..13);
+// the fused extern has block_table at 10 and the attention tensors at 12..14,17.
+#ifdef QWEN_FAI_ROPE_ONLY_ABI
 constexpr int32_t kRopeQueryArg = 10;       // InOut BF16: rotated Q (q_tnd_flat)
 constexpr int32_t kRopeKeyCacheArg = 11;    // InOut BF16: paged K cache
 constexpr int32_t kRopeValueCacheArg = 12;  // InOut BF16: paged V cache
 constexpr int32_t kRopeCacheRowOffsetArg = 13;
+#else
+constexpr int32_t kRopeQueryArg = 12;
+constexpr int32_t kRopeKeyCacheArg = 13;
+constexpr int32_t kRopeValueCacheArg = 14;
+constexpr int32_t kRopeCacheRowOffsetArg = 17;
+#endif
 
 // Static batch-16 architecture constants (Qwen3-14B decode contract).
 constexpr uint32_t kQwenBatch = 16;
@@ -417,6 +452,6 @@ static __aicore__ void run_qwen_rope_qkv(__gm__ int64_t *args) {
 #endif
 }
 
-#endif  // QWEN_FAI_ROPE_ONLY_ABI
+#endif  // !QWEN_FAI_ATTENTION_ONLY_ABI (rope_qkv producer)
 
 #endif

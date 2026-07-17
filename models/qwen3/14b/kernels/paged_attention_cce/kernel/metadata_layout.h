@@ -28,11 +28,19 @@ constexpr uint32_t kBarrierSlotBytes = 512;
 constexpr uint32_t kBarrierSlotWords = kBarrierSlotBytes / sizeof(int32_t);
 constexpr uint32_t kBarrierSlotCount = 48;
 constexpr uint32_t kBarrierBytes = kBarrierSlotCount * kBarrierSlotBytes;
-constexpr uint32_t kMetadataBytes = 27840;
+// Producer-only RoPE-ready soft-barrier region, laid out right after the aligned
+// FAI barrier. The fused kernel's AIV lanes barrier among themselves here, then one
+// sub-lane per AIC pair signals the AIC attention via CrossCoreSetFlag.
+constexpr uint32_t kRopeReadySlotBytes = 32;
+constexpr uint32_t kRopeReadySlotWords = kRopeReadySlotBytes / sizeof(int32_t);
+constexpr uint32_t kRopeReadySlotCount = 48;
+constexpr uint32_t kRopeReadyBytes = kRopeReadySlotCount * kRopeReadySlotBytes;
+constexpr uint16_t kRopeReadyCrossCoreFlag = 0;
+constexpr uint32_t kMetadataBytes = 29376;
 
 static_assert(
-    kBarrierAlignmentOffset + kBarrierAlignmentBytes - 1 + kBarrierBytes <= kMetadataBytes,
-    "metadata buffer does not cover the aligned barrier region"
+    kBarrierAlignmentOffset + kBarrierAlignmentBytes - 1 + kBarrierBytes + kRopeReadyBytes <= kMetadataBytes,
+    "metadata buffer does not cover the aligned FAI and RoPE-ready regions"
 );
 
 }  // namespace qwen_fai_metadata
