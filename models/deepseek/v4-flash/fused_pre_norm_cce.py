@@ -65,7 +65,9 @@ _INCLUDE_DIRS = _cann_include_dirs() + (
 )
 
 SUPPORTED_PLATFORMS = ("a2a3", "a2a3sim")
-FUSED_AIV_CORES = 48
+FUSED_AIV_CORES = 8
+SOFT_SYNC_SLOT_INT32 = 8
+FUSED_SOFT_SYNC_WORDS = FUSED_AIV_CORES * SOFT_SYNC_SLOT_INT32
 D = M.hidden_size
 HC_MULT = M.hc_mult
 HC_DIM = M.hc_dim
@@ -80,7 +82,7 @@ GATE_M_TILE = 16
 T_DYN = pl.dynamic("FUSED_PRE_NORM_T_DYN")
 T_PAD_DYN = pl.dynamic("FUSED_PRE_NORM_T_PAD_DYN")
 
-# Debug entry stop points. Every physical AIV takes the same branch.
+# Debug entry stop points. Every logical AIV takes the same branch.
 STOP_SPLIT_BEFORE_BARRIER1 = 0
 STOP_AFTER_BARRIER1 = 1
 STOP_MIX_BEFORE_BARRIER2 = 2
@@ -107,6 +109,9 @@ def fused_pre_norm_cce(
     ffn_inv_rms_buf: pl.Out[pl.Tensor],
     xn_scale_buf: pl.Out[pl.Tensor],
     x_norm_scale: pl.Out[pl.Tensor],
+    sync_workspace: pl.InOut[
+        pl.Tensor[[FUSED_SOFT_SYNC_WORDS], pl.INT32]
+    ],
     scale0: pl.Scalar[pl.FP32],
     scale1: pl.Scalar[pl.FP32],
     num_tokens: pl.Scalar[pl.INDEX],
@@ -148,6 +153,9 @@ def fused_pre_norm_debug_cce(
     ffn_inv_rms_buf: pl.Out[pl.Tensor],
     xn_scale_buf: pl.Out[pl.Tensor],
     x_norm_scale: pl.Out[pl.Tensor],
+    sync_workspace: pl.InOut[
+        pl.Tensor[[FUSED_SOFT_SYNC_WORDS], pl.INT32]
+    ],
     scale0: pl.Scalar[pl.FP32],
     scale1: pl.Scalar[pl.FP32],
     num_tokens: pl.Scalar[pl.INDEX],
@@ -233,6 +241,11 @@ def fused_pre_norm_test(
     ffn_inv_rms_buf.bind_dynamic(0, T_PAD_DYN)
     xn_scale_buf.bind_dynamic(0, T_PAD_DYN)
 
+    sync_workspace = pl.create_tensor(
+        [FUSED_SOFT_SYNC_WORDS],
+        dtype=pl.INT32,
+        init_value=0,
+    )
     _tag_test_tensors(
         x_flat,
         inv_rms,
@@ -247,10 +260,19 @@ def fused_pre_norm_test(
         xn_scale_buf,
         x_norm_scale,
     )
+    # dump_tag is forward-sticky and marks both the before-dispatch and
+    # after-completion snapshots of this InOut task argument. Do not reference
+    # the consumed InOut value after the extern submit.
+    pl.dump_tag(sync_workspace)
     ready_tid = pl.system.task_dummy(deps=[])
     # A direct call lets @pl.jit specialize the external callable referenced by
     # the spmd_submit below. The constant-false branch is removed before codegen.
     if False:
+        _sync_workspace_specialize = pl.create_tensor(
+            [FUSED_SOFT_SYNC_WORDS],
+            dtype=pl.INT32,
+            init_value=0,
+        )
         (
             x_mixed,
             pre_val_store,
@@ -272,6 +294,7 @@ def fused_pre_norm_test(
             ffn_inv_rms_buf,
             xn_scale_buf,
             x_norm_scale,
+            _sync_workspace_specialize,
             scale0,
             scale1,
             num_tokens,
@@ -301,6 +324,7 @@ def fused_pre_norm_test(
         ffn_inv_rms_buf,
         xn_scale_buf,
         x_norm_scale,
+        sync_workspace,
         scale0,
         scale1,
         num_tokens,
@@ -352,7 +376,7 @@ def fused_pre_norm_debug_test(
     num_tokens: pl.Scalar[pl.INDEX],
     stop_after: pl.Scalar[pl.INT32],
 ):
-    """Debug-entry test that brackets each generated body and SyncAll."""
+    """Debug-entry test that brackets each generated body and soft barrier."""
     x_flat.bind_dynamic(0, T_DYN)
     x_mixed.bind_dynamic(0, T_DYN)
     post.bind_dynamic(0, T_DYN)
@@ -364,6 +388,11 @@ def fused_pre_norm_debug_test(
     ffn_inv_rms_buf.bind_dynamic(0, T_PAD_DYN)
     xn_scale_buf.bind_dynamic(0, T_PAD_DYN)
 
+    sync_workspace = pl.create_tensor(
+        [FUSED_SOFT_SYNC_WORDS],
+        dtype=pl.INT32,
+        init_value=0,
+    )
     _tag_test_tensors(
         x_flat,
         inv_rms,
@@ -378,8 +407,14 @@ def fused_pre_norm_debug_test(
         xn_scale_buf,
         x_norm_scale,
     )
+    pl.dump_tag(sync_workspace)
     ready_tid = pl.system.task_dummy(deps=[])
     if False:
+        _sync_workspace_specialize = pl.create_tensor(
+            [FUSED_SOFT_SYNC_WORDS],
+            dtype=pl.INT32,
+            init_value=0,
+        )
         (
             x_mixed,
             pre_val_store,
@@ -401,6 +436,7 @@ def fused_pre_norm_debug_test(
             ffn_inv_rms_buf,
             xn_scale_buf,
             x_norm_scale,
+            _sync_workspace_specialize,
             scale0,
             scale1,
             num_tokens,
@@ -431,6 +467,7 @@ def fused_pre_norm_debug_test(
         ffn_inv_rms_buf,
         xn_scale_buf,
         x_norm_scale,
+        sync_workspace,
         scale0,
         scale1,
         num_tokens,
@@ -667,6 +704,8 @@ def poison_aware_allclose(actual, expected, *, rtol=1e-3, atol=1e-3, **_):
 
 __all__ = [
     "FUSED_AIV_CORES",
+    "FUSED_SOFT_SYNC_WORDS",
+    "SOFT_SYNC_SLOT_INT32",
     "STOP_AFTER_BARRIER1",
     "STOP_AFTER_BARRIER2",
     "STOP_FULL",

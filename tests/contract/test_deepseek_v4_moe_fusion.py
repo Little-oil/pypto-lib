@@ -44,6 +44,7 @@ _TENSOR_ARGS = (
     "ffn_inv_rms_buf",
     "xn_scale_buf",
     "x_norm_scale",
+    "sync_workspace",
 )
 _SCALAR_ARGS = ("scale0", "scale1", "num_tokens")
 _PHASE_OUTPUTS = (
@@ -56,6 +57,7 @@ _PHASE_OUTPUTS = (
     "x_norm_scale",
 )
 _DUMP_INPUTS = ("x_flat", "inv_rms", "mixes_raw", "hc_base", "norm_w")
+_SYNC_WORKSPACE = "sync_workspace"
 
 
 def _read(path: Path) -> str:
@@ -146,6 +148,49 @@ def _assigned_constant(tree: ast.Module, name: str) -> object:
     return ast.literal_eval(assignment.value)
 
 
+def _assigned_value(tree: ast.Module, name: str) -> ast.AST:
+    assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and (
+            any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
+            )
+            if isinstance(node, ast.Assign)
+            else isinstance(node.target, ast.Name) and node.target.id == name
+        )
+    )
+    return assignment.value
+
+
+def _local_assignment(function: ast.FunctionDef, name: str) -> ast.AST:
+    assignment = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and (
+            any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
+            )
+            if isinstance(node, ast.Assign)
+            else isinstance(node.target, ast.Name) and node.target.id == name
+        )
+    )
+    return assignment.value
+
+
+def _return_names(function: ast.FunctionDef) -> tuple[str, ...]:
+    returns = [node for node in function.body if isinstance(node, ast.Return)]
+    assert len(returns) == 1
+    value = returns[0].value
+    assert isinstance(value, ast.Tuple)
+    assert all(isinstance(element, ast.Name) for element in value.elts)
+    return tuple(element.id for element in value.elts)
+
+
 def _strip_cpp_comments(source: str) -> str:
     source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
     return re.sub(r"//[^\n]*", "", source)
@@ -197,6 +242,7 @@ def test_fused_extern_python_and_cpp_abis_stay_in_lockstep() -> None:
         "Out",
         "Out",
         "Out",
+        "InOut",
         "Scalar",
         "Scalar",
         "Scalar",
@@ -223,11 +269,21 @@ def test_fused_extern_python_and_cpp_abis_stay_in_lockstep() -> None:
             for argument in arguments
             if _annotation_kind(argument.annotation) in {"Out", "InOut"}
         ]
-        assert output_like == list(_PHASE_OUTPUTS)
+        assert output_like == [*_PHASE_OUTPUTS, _SYNC_WORKSPACE]
         assert output_like[0] == "x_mixed", (
             "the first extern result must bind to the first pl.Out argument"
         )
         assert _annotation_kind(arguments[0].annotation) == "Out"
+        assert _annotation_kind(
+            next(
+                argument.annotation
+                for argument in arguments
+                if argument.arg == _SYNC_WORKSPACE
+            )
+        ) == "InOut"
+        assert _return_names(function) == _PHASE_OUTPUTS, (
+            "the mutable synchronization workspace is not a public result"
+        )
 
         decorator = _extern_decorator(function)
         assert ast.literal_eval(_keyword(decorator, "core_type")) == "aiv"
@@ -259,9 +315,10 @@ def test_fused_extern_python_and_cpp_abis_stay_in_lockstep() -> None:
         "kFfnInvRms",
         "kXnScale",
         "kXNormScale",
+        "kSyncWorkspace",
         "kTensorArgCount",
     ]
-    assert re.search(r"\bkTensorArgCount\s*=\s*12\s*,", body)
+    assert re.search(r"\bkTensorArgCount\s*=\s*13\s*,", body)
     assert _enum_symbols(body, "ScalarArg") == [
         "kScale0",
         "kScale1",
@@ -272,11 +329,22 @@ def test_fused_extern_python_and_cpp_abis_stay_in_lockstep() -> None:
     ]
     assert re.search(r"\bkScale0\s*=\s*kTensorArgCount\s*,", body)
     assert re.search(r"\bkDebugStopAfter\s*=\s*kProductionArgCount\s*,", body)
+    assert re.search(
+        r"int32_t\s*\*\s*sync_workspace\s*="
+        r"\s*tensor_data\s*<\s*int32_t\s*>\s*"
+        r"\(\s*args\s*,\s*kSyncWorkspace\s*\)\s*;",
+        body,
+    )
 
 
-def test_every_fused_launch_is_one_synchronously_started_48_aiv_wave() -> None:
+def test_every_fused_launch_is_one_synchronously_started_8_aiv_wave() -> None:
     tree = _parse(_BRIDGE)
-    assert _assigned_constant(tree, "FUSED_AIV_CORES") == 48
+    assert _assigned_constant(tree, "FUSED_AIV_CORES") == 8
+    assert _assigned_constant(tree, "SOFT_SYNC_SLOT_INT32") == 8
+    assert ast.unparse(_assigned_value(tree, "FUSED_SOFT_SYNC_WORDS")) == (
+        "FUSED_AIV_CORES * SOFT_SYNC_SLOT_INT32"
+    )
+    assert "FUSED_SOFT_SYNC_WORDS" in _assigned_constant(tree, "__all__")
 
     for function_name, extern_name in (
         ("fused_pre_norm_test", "fused_pre_norm_cce"),
@@ -301,7 +369,147 @@ def test_every_fused_launch_is_one_synchronously_started_48_aiv_wave() -> None:
     )
 
     body = _read(_FUSED_BODY)
-    assert re.search(r"\bkAivLanes\s*=\s*48\s*;", body)
+    assert re.search(r"\bkAivLanes\s*=\s*8\s*;", body)
+
+    audit = _function(_parse(_MOE), "audit_fused_pre_norm_codegen")
+    audit_source = ast.get_source_segment(_read(_MOE), audit)
+    assert audit_source is not None
+    assert ".launch_spec.set_block_num(8);" in audit_source
+    assert ".launch_spec.set_require_sync_start(true);" in audit_source
+    audit_patterns = {
+        node.value
+        for node in ast.walk(audit)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert any(
+        r"\.add_inout\(" in pattern and _SYNC_WORKSPACE in pattern
+        for pattern in audit_patterns
+    )
+    assert any(
+        r"\.dump\(" in pattern and _SYNC_WORKSPACE in pattern
+        for pattern in audit_patterns
+    ), "the generated fused task must dump its write-after InOut workspace"
+
+
+def test_each_python_launch_owns_one_zeroed_inout_sync_workspace() -> None:
+    bridge_tree = _parse(_BRIDGE)
+    launch_specs = (
+        (
+            _function(bridge_tree, "fused_pre_norm_test"),
+            "fused_pre_norm_cce",
+            (
+                "x_mixed",
+                "x_flat",
+                "inv_rms",
+                "mixes_raw",
+                "hc_base",
+                "norm_w",
+                "pre_val_store",
+                "post",
+                "xg_buf",
+                "ffn_inv_rms_buf",
+                "xn_scale_buf",
+                "x_norm_scale",
+                "sync_workspace",
+                "scale0",
+                "scale1",
+                "num_tokens",
+            ),
+        ),
+        (
+            _function(bridge_tree, "fused_pre_norm_debug_test"),
+            "fused_pre_norm_debug_cce",
+            (
+                "x_mixed",
+                "x_flat",
+                "inv_rms",
+                "mixes_raw",
+                "hc_base",
+                "norm_w",
+                "pre_val_store",
+                "post",
+                "xg_buf",
+                "ffn_inv_rms_buf",
+                "xn_scale_buf",
+                "x_norm_scale",
+                "sync_workspace",
+                "scale0",
+                "scale1",
+                "num_tokens",
+                "stop_after",
+            ),
+        ),
+        (
+            _function(_parse(_MOE), "moe"),
+            "fused_pre_norm_cce",
+            (
+                "x_mixed",
+                "x_flat",
+                "hc_inv_rms",
+                "mixes_raw",
+                "hc_ffn_base",
+                "norm_w",
+                "pre_val_store",
+                "post_ffn",
+                "xg_buf",
+                "gate_inv_rms_buf",
+                "xn_scale_buf",
+                "x_norm_scale",
+                "sync_workspace",
+                "scale0",
+                "scale1",
+                "num_tokens_index",
+            ),
+        ),
+    )
+
+    for function, extern_name, expected_args in launch_specs:
+        for workspace_name in (
+            _SYNC_WORKSPACE,
+            "_sync_workspace_specialize",
+        ):
+            create = _local_assignment(function, workspace_name)
+            assert isinstance(create, ast.Call)
+            assert _qualified_name(create.func) == "pl.create_tensor"
+            assert len(create.args) == 1
+            assert ast.unparse(create.args[0]) == "[FUSED_SOFT_SYNC_WORDS]"
+            assert ast.unparse(_keyword(create, "dtype")) == "pl.INT32"
+            assert ast.literal_eval(_keyword(create, "init_value")) == 0
+            assert not any(
+                keyword.arg == "manual_dep" for keyword in create.keywords
+            )
+
+        direct_calls = _calls(function, extern_name)
+        launches = _calls(function, "pl.spmd_submit")
+        assert len(direct_calls) == len(launches) == 1
+        specialize_args = tuple(
+            "_sync_workspace_specialize"
+            if name == _SYNC_WORKSPACE
+            else name
+            for name in expected_args
+        )
+        assert tuple(ast.unparse(arg) for arg in direct_calls[0].args) == (
+            specialize_args
+        )
+        assert tuple(ast.unparse(arg) for arg in launches[0].args[1:]) == (
+            expected_args
+        )
+        assert ast.unparse(_keyword(launches[0], "core_num")) == (
+            "FUSED_AIV_CORES"
+        )
+        assert ast.literal_eval(_keyword(launches[0], "sync_start")) is True
+
+        forbidden_wrappers = {
+            _qualified_name(node.func)
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and _qualified_name(node.func) in {"pl.no_dep", "pl.manual_scope"}
+            and any(
+                isinstance(arg, ast.Name) and arg.id == _SYNC_WORKSPACE
+                for arg in node.args
+            )
+        }
+        assert not forbidden_wrappers
 
 
 def test_moe_passes_producer_and_fused_task_ids_across_scheduler_boundaries() -> None:
@@ -418,14 +626,31 @@ def test_comb_sinkhorn_uses_with_spmd_and_waits_directly_on_dispatch_gather() ->
         assert ast.literal_eval(_keyword(create, "manual_dep")) is True
 
 
-def test_aiv_fusion_uses_exactly_two_hardware_syncall_barriers() -> None:
+def test_aiv_fusion_uses_exactly_two_indexed_soft_barriers() -> None:
     body = _strip_cpp_comments(_read(_FUSED_BODY))
     sync_calls = re.findall(
-        r"AscendC::SyncAll\s*<\s*>\s*\(\s*\)\s*;",
+        r"\bsoft_sync_aiv\s*\(\s*sync_workspace\s*,\s*lane\s*\)\s*;",
         body,
     )
     assert len(sync_calls) == 2
-    assert len(re.findall(r"AscendC::SyncAll", body)) == 2
+    assert re.search(
+        r"\bsoft_sync_aiv\s*\(\s*"
+        r"__gm__\s+int32_t\s*\*\s*gm_workspace\s*,\s*"
+        r"int32_t\s+participant_idx\s*\)",
+        body,
+    )
+    assert re.search(
+        r"pto::SYNCALL_SOFT_AIV_BARRIER\s*\(\s*"
+        r"gm_workspace\s*,\s*ub_workspace\s*,\s*"
+        r"kAivLanes\s*,\s*participant_idx\s*\)\s*;",
+        body,
+    )
+    assert re.search(
+        r"const\s+int32_t\s+lane\s*=\s*"
+        r"static_cast\s*<\s*int32_t\s*>\s*"
+        r"\(\s*get_block_idx\s*\(\s*args\s*\)\s*\)\s*;",
+        body,
+    )
 
     all_kernel_code = "\n".join(
         _strip_cpp_comments(_read(path))
@@ -433,18 +658,150 @@ def test_aiv_fusion_uses_exactly_two_hardware_syncall_barriers() -> None:
         if path.suffix in {".cpp", ".h", ".hpp"}
     )
     forbidden = {
-        "SyncAll<false>": r"SyncAll\s*<\s*false\s*>",
-        "software synchronization": (
-            r"\b(?:soft(?:ware)?[_\s-]*(?:sync|barrier)|"
-            r"(?:sync|barrier)[_\s-]*soft(?:ware)?)\b"
-        ),
-        "dcci": r"\bdcci\b",
-        "dsb": r"\bdsb\b",
+        "hardware AscendC SyncAll": r"\bAscendC::SyncAll\b",
+        "public hard/implicit SYNCALL": r"\b(?:pto::)?SYNCALL\s*<",
+        "bare physical get_block_idx": r"\bget_block_idx\s*\(\s*\)",
+        "FFTS cross-core synchronization": r"\bffts_cross_core_sync\b",
     }
     for description, pattern in forbidden.items():
         assert re.search(pattern, all_kernel_code, flags=re.IGNORECASE) is None, (
-            f"pure-AIV fusion must not add {description}"
+            f"8-lane dynamic scheduling must not use {description}"
         )
+
+
+def test_soft_barriers_publish_and_acquire_owned_business_ranges() -> None:
+    body = _strip_cpp_comments(_read(_FUSED_BODY))
+    assert re.search(
+        r"for\s*\(\s*uint64_t\s+line\s*=\s*first\s*;"
+        r"\s*line\s*<\s*end\s*;"
+        r"\s*line\s*\+=\s*kA2A3DcciLineBytes\s*\)",
+        body,
+    )
+    assert re.search(r"dcci\s*\([^;]*CACHELINE_OUT[^;]*\)\s*;", body)
+    assert re.search(
+        r"dcci\s*\([^;]*SINGLE_CACHE_LINE\s*\)\s*;",
+        body,
+    )
+    for call in (
+        "publish_pre_value(pre_value, lane, split_work);",
+        "acquire_pre_value(pre_value, lane, mix_work);",
+        "publish_x_mixed(x_mixed, lane, mix_work);",
+        "acquire_x_mixed(x_mixed, lane, ffn_work);",
+    ):
+        assert body.count(call) == 1
+
+    positions = {
+        call: body.index(call)
+        for call in (
+            "publish_pre_value(pre_value, lane, split_work);",
+            "soft_sync_aiv(sync_workspace, lane);",
+            "acquire_pre_value(pre_value, lane, mix_work);",
+            "publish_x_mixed(x_mixed, lane, mix_work);",
+            "acquire_x_mixed(x_mixed, lane, ffn_work);",
+        )
+    }
+    barrier_positions = [
+        match.start()
+        for match in re.finditer(
+            r"soft_sync_aiv\s*\(\s*sync_workspace\s*,\s*lane\s*\)\s*;",
+            body,
+        )
+    ]
+    assert len(barrier_positions) == 2
+    assert (
+        positions["publish_pre_value(pre_value, lane, split_work);"]
+        < barrier_positions[0]
+        < positions["acquire_pre_value(pre_value, lane, mix_work);"]
+        < positions["publish_x_mixed(x_mixed, lane, mix_work);"]
+        < barrier_positions[1]
+        < positions["acquire_x_mixed(x_mixed, lane, ffn_work);"]
+    )
+
+
+def test_soft_barrier_scratch_stays_above_generated_ub_and_below_pto_tmp() -> None:
+    body = _strip_cpp_comments(_read(_FUSED_BODY))
+    assert "#include <pto/pto-inst.hpp>" in _read(_FUSED_BODY)
+    assert re.search(
+        r"\bkSoftSyncUbAddr\s*=\s*176U?\s*\*\s*1024U?\s*;",
+        body,
+    )
+    assert re.search(
+        r"\bkSoftSyncWords\s*=\s*kAivLanes\s*\*\s*"
+        r"pto::SYNCALL_SOFT_SLOT_INT32\s*;",
+        body,
+    )
+    assert re.search(
+        r"\bkA2A3DcciLineBytes\s*=\s*64U?\s*;",
+        body,
+    )
+    compact_body = re.sub(r"\s+", "", body)
+    assert (
+        "static_assert("
+        "kSoftSyncUbAddr%kA2A3DcciLineBytes==0U"
+        ");"
+    ) in compact_body
+    scratch_bound = (
+        "kSoftSyncUbAddr+"
+        "static_cast<uint32_t>(kSoftSyncWords*sizeof(int32_t))"
+        "<=pto::TMP_UB_OFFSET"
+    )
+    assert f"static_assert({scratch_bound});" in compact_body
+    assert re.search(
+        r"reinterpret_cast\s*<\s*__ubuf__\s+int32_t\s*\*\s*>\s*"
+        r"\(\s*kSoftSyncUbAddr\s*\)",
+        body,
+    )
+
+    # Generated PTO bodies bind every UB tile with TASSIGN(tile, address_var).
+    # Resolve those address variables back to their numeric constants and make
+    # sure a regeneration cannot silently move a tile into the reserved sync
+    # scratch starting at 176 KiB.
+    scratch_start = 176 * 1024
+    generated_ub_ends: list[int] = []
+    element_bytes = {"float": 4, "bfloat16_t": 2}
+    for path in sorted((_KERNEL_DIR / "kernel").glob("*_generated.hpp")):
+        source = _strip_cpp_comments(_read(path))
+        signed_constants = {
+            name: int(value)
+            for name, value in re.findall(
+                r"\bconst\s+int64_t\s+(v\d+)\s*=\s*(\d+)\s*;",
+                source,
+            )
+        }
+        address_aliases = {
+            target: source_name
+            for target, source_name in re.findall(
+                r"\buint64_t\s+(v\d+)\s*=\s*"
+                r"\(\s*uint64_t\s*\)\s*(v\d+)\s*;",
+                source,
+            )
+        }
+        tile_bytes = {
+            tile: int(rows) * int(cols) * element_bytes[dtype]
+            for dtype, rows, cols, tile in re.findall(
+                r"\bTile\s*<\s*TileType::\w+\s*,\s*"
+                r"(float|bfloat16_t)\s*,\s*(\d+)\s*,\s*(\d+)"
+                r"[^;\n]*>\s+(v\d+)(?:\s*[=;])",
+                source,
+            )
+        }
+        for tile, address_var in re.findall(
+            r"\bTASSIGN\s*\(\s*(v\d+)\s*,\s*(v\d+)\s*\)\s*;",
+            source,
+        ):
+            constant_name = address_aliases.get(address_var, address_var)
+            assert constant_name in signed_constants, (
+                f"cannot resolve generated UB address {address_var} in {path}"
+            )
+            assert tile in tile_bytes, (
+                f"cannot resolve generated UB tile size for {tile} in {path}"
+            )
+            generated_ub_ends.append(
+                signed_constants[constant_name] + tile_bytes[tile]
+            )
+
+    assert generated_ub_ends, "generated bodies must expose their UB bindings"
+    assert max(generated_ub_ends) < scratch_start
 
 
 def test_generated_phases_keep_grid_stride_mapping_and_barrier_order() -> None:
@@ -474,7 +831,7 @@ def test_generated_phases_keep_grid_stride_mapping_and_barrier_order() -> None:
             body,
             flags=re.DOTALL,
         )
-        assert loop is not None, f"{callee} must retain a 48-lane grid-stride loop"
+        assert loop is not None, f"{callee} must retain an 8-lane grid-stride loop"
         assert re.search(
             rf"logical_block\s*,\s*{work_count}\s*$",
             loop.group(1),
@@ -483,8 +840,12 @@ def test_generated_phases_keep_grid_stride_mapping_and_barrier_order() -> None:
 
     barrier_positions = [
         match.start()
-        for match in re.finditer(r"AscendC::SyncAll\s*<\s*>", body)
+        for match in re.finditer(
+            r"\bsoft_sync_aiv\s*\(\s*sync_workspace\s*,\s*lane\s*\)",
+            body,
+        )
     ]
+    assert len(barrier_positions) == 2
     assert (
         phase_positions[0]
         < barrier_positions[0]
@@ -570,6 +931,9 @@ def test_dump_tags_bracket_the_extern_and_cover_consumer_side_buffers() -> None:
     assert {name for _, name in _dump_calls(tag_helper)} == set(
         (*_DUMP_INPUTS, *_PHASE_OUTPUTS),
     )
+    assert _SYNC_WORKSPACE not in {
+        argument.arg for argument in tag_helper.args.args
+    }
     for function_name, extern_name in (
         ("fused_pre_norm_test", "fused_pre_norm_cce"),
         ("fused_pre_norm_debug_test", "fused_pre_norm_debug_cce"),
@@ -577,17 +941,52 @@ def test_dump_tags_bracket_the_extern_and_cover_consumer_side_buffers() -> None:
         function = _function(bridge_tree, function_name)
         tag_calls = _calls(function, "_tag_test_tensors")
         extern_calls = _calls(function, extern_name)
+        launches = _calls(function, "pl.spmd_submit")
         assert len(tag_calls) == 2
         assert len(extern_calls) == 1
-        assert tag_calls[0].lineno < extern_calls[0].lineno < tag_calls[1].lineno
+        assert len(launches) == 1
+        workspace_dump_lines = [
+            line
+            for line, name in _dump_calls(function)
+            if name == _SYNC_WORKSPACE
+        ]
+        assert len(workspace_dump_lines) == 1, (
+            "the consumed InOut workspace may only be tagged before submit"
+        )
+        assert (
+            tag_calls[0].lineno
+            < workspace_dump_lines[0]
+            < extern_calls[0].lineno
+            < launches[0].lineno
+            < tag_calls[1].lineno
+        )
+        assert "_sync_workspace_specialize" in {
+            ast.unparse(argument) for argument in extern_calls[0].args
+        }
+        assert _SYNC_WORKSPACE in {
+            ast.unparse(argument) for argument in launches[0].args[1:]
+        }
 
     model = _function(_parse(_MOE), "moe")
     model_extern = _calls(model, "fused_pre_norm_cce")
+    model_launch = _calls(model, "pl.spmd_submit")
     assert len(model_extern) == 1
-    model_extern_line = model_extern[0].lineno
+    assert len(model_launch) == 1
+    model_launch_line = model_launch[0].lineno
     model_dumps = _dump_calls(model)
-    before = {name for line, name in model_dumps if line < model_extern_line}
-    after = {name for line, name in model_dumps if line > model_extern_line}
+    workspace_dump_lines = [
+        line for line, name in model_dumps if name == _SYNC_WORKSPACE
+    ]
+    assert len(workspace_dump_lines) == 1
+    assert workspace_dump_lines[0] < model_extern[0].lineno < model_launch_line
+    assert "_sync_workspace_specialize" in {
+        ast.unparse(argument) for argument in model_extern[0].args
+    }
+    assert _SYNC_WORKSPACE in {
+        ast.unparse(argument) for argument in model_launch[0].args[1:]
+    }
+    before = {name for line, name in model_dumps if line < model_launch_line}
+    after = {name for line, name in model_dumps if line > model_launch_line}
     assert {
         "x_flat",
         "hc_inv_rms",
@@ -601,6 +1000,7 @@ def test_dump_tags_bracket_the_extern_and_cover_consumer_side_buffers() -> None:
         "gate_inv_rms_buf",
         "xn_scale_buf",
         "x_norm_scale",
+        _SYNC_WORKSPACE,
     } <= before
     assert {
         "x_mixed",
@@ -611,6 +1011,7 @@ def test_dump_tags_bracket_the_extern_and_cover_consumer_side_buffers() -> None:
         "xn_scale_buf",
         "x_norm_scale",
     } <= after
+    assert _SYNC_WORKSPACE not in after
 
     gate = _function(_parse(_GATE), "gate_precomputed")
     assert {

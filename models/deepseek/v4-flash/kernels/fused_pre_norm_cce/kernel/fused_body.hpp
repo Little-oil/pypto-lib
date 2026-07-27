@@ -9,6 +9,8 @@
 
 #include <cstdint>
 
+#include <pto/pto-inst.hpp>
+
 #include "intrinsic.h"
 #include "kernel_operator.h"
 #include "tensor.h"
@@ -20,9 +22,9 @@
 namespace deepseek_fused_pre_norm {
 
 // This entry is a pure-AIV extern. On Ascend A2/A3 it must be launched as one
-// synchronously-started 48-AIV wave. Every lane reaches both SyncAll barriers,
+// synchronously-started 8-AIV wave. Every lane reaches both soft barriers,
 // including lanes with no logical work in the surrounding phase.
-constexpr int32_t kAivLanes = 48;
+constexpr int32_t kAivLanes = 8;
 constexpr int64_t kTokenTile = 8;
 constexpr int64_t kMixSlicesPerTokenTile = 4;
 constexpr int64_t kGateTokenTile = 16;
@@ -42,7 +44,8 @@ enum TensorArg : int32_t {
   kFfnInvRms = 9,    // FP32 [T_PAD, 1]
   kXnScale = 10,     // FP32 [T_PAD, 1]
   kXNormScale = 11,  // FP32 [T, 1]
-  kTensorArgCount = 12,
+  kSyncWorkspace = 12,  // INT32 [kSoftSyncWords], per-grid InOut
+  kTensorArgCount = 13,
 };
 
 enum ScalarArg : int32_t {
@@ -64,6 +67,133 @@ enum class StopAfter : int32_t {
   kAfterBarrier2 = 3,
   kFull = 4,
 };
+
+#ifdef __DAV_C220_VEC__
+// The generated phase bodies currently use less than 65 KiB of UB. Keep the
+// software-barrier scratch below PTO's fixed [184 KiB, 192 KiB) temporary
+// region and far above the generated bodies' current high-water mark.
+constexpr uint32_t kSoftSyncUbAddr = 176U * 1024U;
+constexpr int32_t kSoftSyncWords =
+    kAivLanes * pto::SYNCALL_SOFT_SLOT_INT32;
+constexpr uint64_t kA2A3DcciLineBytes = 64U;
+constexpr int64_t kPreValueWidth = 8;
+constexpr int64_t kHiddenDim = 4096;
+constexpr int64_t kMixSliceWidth = 1024;
+
+static_assert(kSoftSyncUbAddr % kA2A3DcciLineBytes == 0U);
+static_assert(
+    kSoftSyncUbAddr +
+            static_cast<uint32_t>(kSoftSyncWords * sizeof(int32_t)) <=
+        pto::TMP_UB_OFFSET);
+static_assert(
+    kA2A3DcciLineBytes != 0U &&
+    (kA2A3DcciLineBytes & (kA2A3DcciLineBytes - 1U)) == 0U);
+static_assert(kHiddenDim == kMixSlicesPerTokenTile * kMixSliceWidth);
+
+// A2/A3 dcci operates on a complete 64-byte line. The producer form writes
+// dirty data out; the consumer form invalidates any stale local copy. Callers
+// issue one DSB after all ranges owned by the lane have been processed.
+static __aicore__ __attribute__((always_inline)) void dcci_range(
+    __gm__ void *address, uint64_t bytes, bool publish) {
+  if (bytes == 0U) {
+    return;
+  }
+
+  const uint64_t raw = reinterpret_cast<uint64_t>(address);
+  const uint64_t first = raw & ~(kA2A3DcciLineBytes - 1U);
+  const uint64_t end =
+      (raw + bytes + kA2A3DcciLineBytes - 1U) &
+      ~(kA2A3DcciLineBytes - 1U);
+  for (uint64_t line = first; line < end; line += kA2A3DcciLineBytes) {
+    __asm__ __volatile__("");
+    if (publish) {
+      dcci(reinterpret_cast<__gm__ void *>(line), SINGLE_CACHE_LINE,
+           CACHELINE_OUT);
+    } else {
+      dcci(reinterpret_cast<__gm__ void *>(line), SINGLE_CACHE_LINE);
+    }
+    __asm__ __volatile__("");
+  }
+}
+
+static __aicore__ __attribute__((always_inline)) void publish_pre_value(
+    __gm__ float *pre_value, int32_t lane, int32_t split_work) {
+  pipe_barrier(PIPE_ALL);
+  constexpr uint64_t kTileBytes =
+      kTokenTile * kPreValueWidth * sizeof(float);
+  constexpr int64_t kTileElements = kTokenTile * kPreValueWidth;
+  for (int32_t logical_block = lane; logical_block < split_work;
+       logical_block += kAivLanes) {
+    dcci_range(
+        static_cast<__gm__ void *>(
+            pre_value + static_cast<int64_t>(logical_block) * kTileElements),
+        kTileBytes, true);
+  }
+  dsb(DSB_DDR);
+}
+
+static __aicore__ __attribute__((always_inline)) void acquire_pre_value(
+    __gm__ float *pre_value, int32_t lane, int32_t mix_work) {
+  constexpr uint64_t kTileBytes =
+      kTokenTile * kPreValueWidth * sizeof(float);
+  constexpr int64_t kTileElements = kTokenTile * kPreValueWidth;
+  for (int32_t logical_block = lane; logical_block < mix_work;
+       logical_block += kAivLanes) {
+    const int64_t token_tile =
+        logical_block / kMixSlicesPerTokenTile;
+    dcci_range(
+        static_cast<__gm__ void *>(pre_value + token_tile * kTileElements),
+        kTileBytes, false);
+  }
+  dsb(DSB_DDR);
+}
+
+static __aicore__ __attribute__((always_inline)) void publish_x_mixed(
+    __gm__ bfloat16_t *x_mixed, int32_t lane, int32_t mix_work) {
+  pipe_barrier(PIPE_ALL);
+  constexpr uint64_t kSliceBytes =
+      kMixSliceWidth * sizeof(bfloat16_t);
+  for (int32_t logical_block = lane; logical_block < mix_work;
+       logical_block += kAivLanes) {
+    const int64_t token_tile =
+        logical_block / kMixSlicesPerTokenTile;
+    const int64_t d_slice =
+        logical_block % kMixSlicesPerTokenTile;
+    const int64_t first_token = token_tile * kTokenTile;
+    for (int64_t row = 0; row < kTokenTile; ++row) {
+      const int64_t offset =
+          (first_token + row) * kHiddenDim + d_slice * kMixSliceWidth;
+      dcci_range(
+          static_cast<__gm__ void *>(x_mixed + offset), kSliceBytes, true);
+    }
+  }
+  dsb(DSB_DDR);
+}
+
+static __aicore__ __attribute__((always_inline)) void acquire_x_mixed(
+    __gm__ bfloat16_t *x_mixed, int32_t lane, int32_t ffn_work) {
+  constexpr uint64_t kRowBytes = kHiddenDim * sizeof(bfloat16_t);
+  for (int32_t logical_block = lane; logical_block < ffn_work;
+       logical_block += kAivLanes) {
+    dcci_range(
+        static_cast<__gm__ void *>(
+            x_mixed + static_cast<int64_t>(logical_block) * kHiddenDim),
+        kRowBytes, false);
+  }
+  dsb(DSB_DDR);
+}
+
+static __aicore__ __attribute__((always_inline)) void soft_sync_aiv(
+    __gm__ int32_t *gm_workspace, int32_t participant_idx) {
+  __ubuf__ int32_t *ub_workspace =
+      reinterpret_cast<__ubuf__ int32_t *>(kSoftSyncUbAddr);
+
+  pipe_barrier(PIPE_ALL);
+  pto::SYNCALL_SOFT_AIV_BARRIER(
+      gm_workspace, ub_workspace, kAivLanes, participant_idx);
+  pipe_barrier(PIPE_ALL);
+}
+#endif  // __DAV_C220_VEC__
 
 template <typename T>
 static __aicore__ __attribute__((always_inline)) __gm__ T *
@@ -136,6 +266,8 @@ run_fused_pre_norm(__gm__ int64_t *args) {
   __gm__ float *ffn_inv_rms = tensor_data<float>(args, kFfnInvRms);
   __gm__ float *xn_scale = tensor_data<float>(args, kXnScale);
   __gm__ float *x_norm_scale = tensor_data<float>(args, kXNormScale);
+  __gm__ int32_t *sync_workspace =
+      tensor_data<int32_t>(args, kSyncWorkspace);
 
   const float scale0 = unpack_float_scalar(args, kScale0);
   const float scale1 = unpack_float_scalar(args, kScale1);
@@ -153,16 +285,19 @@ run_fused_pre_norm(__gm__ int64_t *args) {
     return;
   }
 
-  // AIV-only global barrier: publish every pre_value GM write before mix_x
-  // repartitions work by (token tile, 1024-wide D slice).
-  AscendC::SyncAll<>();
+  // Publish this lane's contiguous 8x8 FP32 tiles before mix_x repartitions
+  // work by (token tile, 1024-wide D slice).
+  publish_pre_value(pre_value, lane, split_work);
+  soft_sync_aiv(sync_workspace, lane);
 
   if constexpr (Stop == StopAfter::kAfterBarrier1) {
     return;
   }
 
+  acquire_pre_value(pre_value, lane, mix_work);
+
   // Preserve mix_x's logical block count rather than passing the physical
-  // 48-lane count. Prefill T=128 has 64 tasks, hence the grid-stride loop.
+  // 8-lane count. Prefill T=128 has 64 tasks, hence the grid-stride loop.
   for (int32_t logical_block = lane; logical_block < mix_work;
        logical_block += kAivLanes) {
     deepseek_fused_pre_norm_mix_generated::mix_x(
@@ -174,16 +309,19 @@ run_fused_pre_norm(__gm__ int64_t *args) {
     return;
   }
 
-  // AIV-only global barrier: publish all four BF16 D slices for each token
-  // before ffn_norm reloads the complete 4096-element row.
-  AscendC::SyncAll<>();
+  // A mix task writes one 1024-wide BF16 slice in each of 8 rows. Publish
+  // those strided slices before ffn_norm reloads complete 4096-element rows.
+  publish_x_mixed(x_mixed, lane, mix_work);
+  soft_sync_aiv(sync_workspace, lane);
 
   if constexpr (Stop == StopAfter::kAfterBarrier2) {
     return;
   }
 
+  acquire_x_mixed(x_mixed, lane, ffn_work);
+
   // ffn_norm preserves the gate's clamp/round-to-16/clamp-to-T semantics.
-  // With num_tokens=0 this is a zero-trip loop after all 48 lanes have crossed
+  // With num_tokens=0 this is a zero-trip loop after all 8 lanes have crossed
   // both barriers; T=128 can require multiple logical tokens per AIV lane.
   for (int32_t logical_block = lane; logical_block < ffn_work;
        logical_block += kAivLanes) {

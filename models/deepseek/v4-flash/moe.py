@@ -35,7 +35,7 @@ def _parse_ep_argv():
 
 EP = _parse_ep_argv()
 config.EP_WORLD_SIZE = EP
-config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * EP)
+config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 16 * EP)
 config.RECV_MAX = EP * config.MOE_TOKENS
 
 import pypto.language as pl
@@ -52,7 +52,11 @@ from hc_pre import (
 )
 from hc_post import hc_post
 from gate import T_PAD as GATE_T_PAD, gate_precomputed
-from fused_pre_norm_cce import FUSED_AIV_CORES, fused_pre_norm_cce
+from fused_pre_norm_cce import (
+    FUSED_AIV_CORES,
+    FUSED_SOFT_SYNC_WORDS,
+    fused_pre_norm_cce,
+)
 from expert_shared import expert_shared
 from expert_routed import expert_routed
 
@@ -464,6 +468,11 @@ def moe(
     xg_buf = pl.create_tensor([GATE_T_PAD, D], dtype=pl.FP32)
     gate_inv_rms_buf = pl.create_tensor([GATE_T_PAD, 1], dtype=pl.FP32)
     xn_scale_buf = pl.create_tensor([GATE_T_PAD, 1], dtype=pl.FP32)
+    sync_workspace = pl.create_tensor(
+        [FUSED_SOFT_SYNC_WORDS],
+        dtype=pl.INT32,
+        init_value=0,
+    )
     x_flat = pl.reshape(x_hc, [T, HC_DIM])
     scale0 = pl.read(hc_ffn_scale, [0])
     scale1 = pl.read(hc_ffn_scale, [1])
@@ -480,9 +489,17 @@ def moe(
     pl.dump_tag(gate_inv_rms_buf)
     pl.dump_tag(xn_scale_buf)
     pl.dump_tag(x_norm_scale)
+    # A pre-submit dump tag is forward-sticky. The runtime snapshots this
+    # InOut argument both before dispatch and after task completion.
+    pl.dump_tag(sync_workspace)
     # A direct call lets @pl.jit specialize the external callable referenced by
     # the spmd_submit below. This constant-false branch is removed before codegen.
     if False:
+        _sync_workspace_specialize = pl.create_tensor(
+            [FUSED_SOFT_SYNC_WORDS],
+            dtype=pl.INT32,
+            init_value=0,
+        )
         (
             x_mixed,
             pre_val_store,
@@ -504,6 +521,7 @@ def moe(
             gate_inv_rms_buf,
             xn_scale_buf,
             x_norm_scale,
+            _sync_workspace_specialize,
             scale0,
             scale1,
             num_tokens_index,
@@ -533,6 +551,7 @@ def moe(
         gate_inv_rms_buf,
         xn_scale_buf,
         x_norm_scale,
+        sync_workspace,
         scale0,
         scale1,
         num_tokens_index,
@@ -1148,6 +1167,7 @@ def audit_fused_pre_norm_codegen(work_dir):
             "gate_inv_rms_buf",
             "xn_scale_buf",
             "x_norm_scale",
+            "sync_workspace",
         ],
         "x_norm_quant": ["xn_scale_buf", "x_norm_i8", "xg_buf"],
         "gate": ["gate_bias", "xg_buf", "gate_w", "gate_inv_rms_buf"],
@@ -1177,7 +1197,7 @@ def audit_fused_pre_norm_codegen(work_dir):
 
     fused_block = task_block("fused_pre_norm_cce")
     for required in (
-        ".launch_spec.set_block_num(48);",
+        ".launch_spec.set_block_num(8);",
         ".launch_spec.set_require_sync_start(true);",
         ".set_dependencies(",
         ".dump(",
@@ -1185,6 +1205,37 @@ def audit_fused_pre_norm_codegen(work_dir):
         if required not in fused_block:
             raise RuntimeError(
                 f"fused-pre-norm ABI audit missing {required!r} in {orch_path}",
+            )
+
+    if re.search(
+        r"\.add_inout\(\s*sync_workspace(?:_inline\d+)?\s*\);",
+        fused_block,
+    ) is None:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires sync_workspace to be InOut in "
+            f"{orch_path}",
+        )
+
+    if re.search(
+        r"\.dump\([^;]*sync_workspace(?:_inline\d+)?[^;]*\);",
+        fused_block,
+    ) is None:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires sync_workspace in the fused "
+            f"task dump set in {orch_path}",
+        )
+
+    workspace_create_checks = (
+        r"sync_workspace(?:_inline\d+)?_ci_shapes\[1\]\s*=\s*\{64\};",
+        r"TensorCreateInfo\s+sync_workspace(?:_inline\d+)?_ci"
+        r"\([^;]*DataType::INT32[^;]*\);",
+        r"sync_workspace(?:_inline\d+)?_ci\.set_initial_value\(0\);",
+    )
+    for pattern in workspace_create_checks:
+        if re.search(pattern, source) is None:
+            raise RuntimeError(
+                "fused-pre-norm ABI audit found an invalid soft-sync workspace "
+                f"declaration for pattern {pattern!r} in {orch_path}",
             )
 
     if not (

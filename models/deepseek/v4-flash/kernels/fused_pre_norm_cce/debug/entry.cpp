@@ -25,12 +25,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { (void)args; }
 
 #include "../kernel/fused_body.hpp"
 
-// Debug ABI appends one uniform INT32 scalar after production's 12 tensors and
+// Debug ABI appends one uniform INT32 scalar after production's 13 tensors and
 // 3 scalars:
-//   0: split body only, before SyncAll #1
-//   1: through SyncAll #1
-//   2: through mix body, before SyncAll #2
-//   3: through SyncAll #2
+//   0: split body only, before soft barrier #1
+//   1: through soft barrier #1
+//   2: through mix body, before soft barrier #2
+//   3: through soft barrier #2
 //   4: full fused body
 // The runtime switch selects compile-time-specialized bodies. No AIV lane may
 // receive a different stop value.
