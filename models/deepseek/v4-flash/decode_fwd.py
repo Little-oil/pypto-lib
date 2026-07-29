@@ -157,9 +157,9 @@ CACHE_POOL_NAMES = frozenset({
 
 # Static weight parameters to keep device-resident, sharded per decode rank.
 # These are leading-dim-stacked ``[N_RANKS, *tail]`` tensors consumed as
-# ``weight[r]`` on ``device=r``.  ``lm_head_weight`` is excluded here because the
-# fixture builds it directly: every DP rank carries a copy of vocab shard
-# ``r % LM_HEAD_TP_SIZE``, since resident arguments are handed out per rank.
+# ``weight[r]`` on ``device=r``. ``lm_head_weight`` is built separately below,
+# but follows the same layout: every DP rank carries a copy of vocab shard
+# ``r % LM_HEAD_TP_SIZE`` and its rank-local slice is kept resident.
 RESIDENT_WEIGHT_NAMES = frozenset(
     [
         n
@@ -1444,7 +1444,13 @@ def build_tensor_specs(
             spec.resident = "stacked"
 
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
-    specs.append(TensorSpec("lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight))
+    specs.append(TensorSpec(
+        "lm_head_weight",
+        [N_RANKS, VOCAB_PER_TP, D],
+        torch.bfloat16,
+        init_value=init_lm_head_weight,
+        resident="stacked",
+    ))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True))
     specs.append(TensorSpec(
