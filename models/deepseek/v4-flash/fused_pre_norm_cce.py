@@ -27,6 +27,8 @@ from config import (
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "fused_pre_norm_cce"
 _ENTRY = _KERNEL_DIR / "entry.cpp"
 _DEBUG_ENTRY = _KERNEL_DIR / "debug" / "entry.cpp"
+_BASELINE_ENTRY = _KERNEL_DIR / "baseline" / "entry.cpp"
+_BASELINE_DEBUG_ENTRY = _KERNEL_DIR / "baseline_debug" / "entry.cpp"
 
 
 def _cann_include_dirs() -> tuple[Path, ...]:
@@ -66,8 +68,11 @@ _INCLUDE_DIRS = _cann_include_dirs() + (
 
 SUPPORTED_PLATFORMS = ("a2a3", "a2a3sim")
 FUSED_AIV_CORES = 8
-SOFT_SYNC_SLOT_INT32 = 8
-FUSED_SOFT_SYNC_WORDS = FUSED_AIV_CORES * SOFT_SYNC_SLOT_INT32
+SOFT_SYNC_COUNTER_INT32 = 16
+FUSED_SOFT_SYNC_COUNTERS = 2
+FUSED_SOFT_SYNC_WORDS = (
+    FUSED_SOFT_SYNC_COUNTERS * SOFT_SYNC_COUNTER_INT32
+)
 D = M.hidden_size
 HC_MULT = M.hc_mult
 HC_DIM = M.hc_dim
@@ -141,6 +146,95 @@ def fused_pre_norm_cce(
     include_dirs=_INCLUDE_DIRS,
 )
 def fused_pre_norm_debug_cce(
+    x_mixed: pl.Out[pl.Tensor],
+    x_flat: pl.Tensor,
+    inv_rms: pl.Tensor,
+    mixes_raw: pl.Tensor,
+    hc_base: pl.Tensor,
+    norm_w: pl.Tensor,
+    pre_val_store: pl.Out[pl.Tensor],
+    post: pl.Out[pl.Tensor],
+    xg_buf: pl.Out[pl.Tensor],
+    ffn_inv_rms_buf: pl.Out[pl.Tensor],
+    xn_scale_buf: pl.Out[pl.Tensor],
+    x_norm_scale: pl.Out[pl.Tensor],
+    sync_workspace: pl.InOut[
+        pl.Tensor[[FUSED_SOFT_SYNC_WORDS], pl.INT32]
+    ],
+    scale0: pl.Scalar[pl.FP32],
+    scale1: pl.Scalar[pl.FP32],
+    num_tokens: pl.Scalar[pl.INDEX],
+    stop_after: pl.Scalar[pl.INT32],
+) -> tuple[
+    pl.Tensor,
+    pl.Tensor,
+    pl.Tensor,
+    pl.Tensor,
+    pl.Tensor,
+    pl.Tensor,
+    pl.Tensor,
+]:
+    return (
+        x_mixed,
+        pre_val_store,
+        post,
+        xg_buf,
+        ffn_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+    )
+
+
+@pl.jit.extern(
+    core_type="aiv",
+    source=_BASELINE_ENTRY,
+    include_dirs=_INCLUDE_DIRS,
+)
+def fused_pre_norm_baseline_cce(
+    x_mixed: pl.Out[pl.Tensor],
+    x_flat: pl.Tensor,
+    inv_rms: pl.Tensor,
+    mixes_raw: pl.Tensor,
+    hc_base: pl.Tensor,
+    norm_w: pl.Tensor,
+    pre_val_store: pl.Out[pl.Tensor],
+    post: pl.Out[pl.Tensor],
+    xg_buf: pl.Out[pl.Tensor],
+    ffn_inv_rms_buf: pl.Out[pl.Tensor],
+    xn_scale_buf: pl.Out[pl.Tensor],
+    x_norm_scale: pl.Out[pl.Tensor],
+    sync_workspace: pl.InOut[
+        pl.Tensor[[FUSED_SOFT_SYNC_WORDS], pl.INT32]
+    ],
+    scale0: pl.Scalar[pl.FP32],
+    scale1: pl.Scalar[pl.FP32],
+    num_tokens: pl.Scalar[pl.INDEX],
+) -> tuple[
+    pl.Tensor,
+    pl.Tensor,
+    pl.Tensor,
+    pl.Tensor,
+    pl.Tensor,
+    pl.Tensor,
+    pl.Tensor,
+]:
+    return (
+        x_mixed,
+        pre_val_store,
+        post,
+        xg_buf,
+        ffn_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+    )
+
+
+@pl.jit.extern(
+    core_type="aiv",
+    source=_BASELINE_DEBUG_ENTRY,
+    include_dirs=_INCLUDE_DIRS,
+)
+def fused_pre_norm_baseline_debug_cce(
     x_mixed: pl.Out[pl.Tensor],
     x_flat: pl.Tensor,
     inv_rms: pl.Tensor,
@@ -501,6 +595,291 @@ def fused_pre_norm_debug_test(
     )
 
 
+@pl.jit
+def fused_pre_norm_baseline_test(
+    x_flat: pl.Tensor[[T_DYN, HC_DIM], pl.FP32],
+    inv_rms: pl.Tensor[[T_PAD_DYN, 1], pl.FP32],
+    mixes_raw: pl.Tensor[[T_PAD_DYN, MIX_PAD], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    x_mixed: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    pre_val_store: pl.InOut[pl.Tensor[[T_PAD_DYN, HC_PAD], pl.FP32]],
+    post: pl.InOut[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    xg_buf: pl.InOut[pl.Tensor[[T_PAD_DYN, D], pl.FP32]],
+    ffn_inv_rms_buf: pl.InOut[pl.Tensor[[T_PAD_DYN, 1], pl.FP32]],
+    xn_scale_buf: pl.InOut[pl.Tensor[[T_PAD_DYN, 1], pl.FP32]],
+    x_norm_scale: pl.InOut[pl.Tensor[[T_DYN, 1], pl.FP32]],
+    scale0: pl.Scalar[pl.FP32],
+    scale1: pl.Scalar[pl.FP32],
+    num_tokens: pl.Scalar[pl.INDEX],
+):
+    """Standalone test-only atomic 8/8 correctness baseline."""
+    x_flat.bind_dynamic(0, T_DYN)
+    x_mixed.bind_dynamic(0, T_DYN)
+    post.bind_dynamic(0, T_DYN)
+    x_norm_scale.bind_dynamic(0, T_DYN)
+    inv_rms.bind_dynamic(0, T_PAD_DYN)
+    mixes_raw.bind_dynamic(0, T_PAD_DYN)
+    pre_val_store.bind_dynamic(0, T_PAD_DYN)
+    xg_buf.bind_dynamic(0, T_PAD_DYN)
+    ffn_inv_rms_buf.bind_dynamic(0, T_PAD_DYN)
+    xn_scale_buf.bind_dynamic(0, T_PAD_DYN)
+
+    sync_workspace = pl.create_tensor(
+        [FUSED_SOFT_SYNC_WORDS],
+        dtype=pl.INT32,
+        init_value=0,
+    )
+    _tag_test_tensors(
+        x_flat,
+        inv_rms,
+        mixes_raw,
+        hc_base,
+        norm_w,
+        x_mixed,
+        pre_val_store,
+        post,
+        xg_buf,
+        ffn_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+    )
+    pl.dump_tag(sync_workspace)
+    ready_tid = pl.system.task_dummy(deps=[])
+    if False:
+        _sync_workspace_specialize = pl.create_tensor(
+            [FUSED_SOFT_SYNC_WORDS],
+            dtype=pl.INT32,
+            init_value=0,
+        )
+        (
+            x_mixed,
+            pre_val_store,
+            post,
+            xg_buf,
+            ffn_inv_rms_buf,
+            xn_scale_buf,
+            x_norm_scale,
+        ) = fused_pre_norm_baseline_cce(
+            x_mixed,
+            x_flat,
+            inv_rms,
+            mixes_raw,
+            hc_base,
+            norm_w,
+            pre_val_store,
+            post,
+            xg_buf,
+            ffn_inv_rms_buf,
+            xn_scale_buf,
+            x_norm_scale,
+            _sync_workspace_specialize,
+            scale0,
+            scale1,
+            num_tokens,
+        )
+    (
+        (
+            x_mixed,
+            pre_val_store,
+            post,
+            xg_buf,
+            ffn_inv_rms_buf,
+            xn_scale_buf,
+            x_norm_scale,
+        ),
+        _fused_tid,
+    ) = pl.spmd_submit(
+        self.fused_pre_norm_baseline_cce,  # noqa: F821 - materialized as a @pl.program method by @pl.jit
+        x_mixed,
+        x_flat,
+        inv_rms,
+        mixes_raw,
+        hc_base,
+        norm_w,
+        pre_val_store,
+        post,
+        xg_buf,
+        ffn_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+        sync_workspace,
+        scale0,
+        scale1,
+        num_tokens,
+        core_num=FUSED_AIV_CORES,
+        sync_start=True,
+        deps=[ready_tid],
+    )
+    _tag_test_tensors(
+        x_flat,
+        inv_rms,
+        mixes_raw,
+        hc_base,
+        norm_w,
+        x_mixed,
+        pre_val_store,
+        post,
+        xg_buf,
+        ffn_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+    )
+    return (
+        x_mixed,
+        pre_val_store,
+        post,
+        xg_buf,
+        ffn_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+    )
+
+
+@pl.jit
+def fused_pre_norm_baseline_debug_test(
+    x_flat: pl.Tensor[[T_DYN, HC_DIM], pl.FP32],
+    inv_rms: pl.Tensor[[T_PAD_DYN, 1], pl.FP32],
+    mixes_raw: pl.Tensor[[T_PAD_DYN, MIX_PAD], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    x_mixed: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    pre_val_store: pl.InOut[pl.Tensor[[T_PAD_DYN, HC_PAD], pl.FP32]],
+    post: pl.InOut[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    xg_buf: pl.InOut[pl.Tensor[[T_PAD_DYN, D], pl.FP32]],
+    ffn_inv_rms_buf: pl.InOut[pl.Tensor[[T_PAD_DYN, 1], pl.FP32]],
+    xn_scale_buf: pl.InOut[pl.Tensor[[T_PAD_DYN, 1], pl.FP32]],
+    x_norm_scale: pl.InOut[pl.Tensor[[T_DYN, 1], pl.FP32]],
+    scale0: pl.Scalar[pl.FP32],
+    scale1: pl.Scalar[pl.FP32],
+    num_tokens: pl.Scalar[pl.INDEX],
+    stop_after: pl.Scalar[pl.INT32],
+):
+    """Debug test-only atomic 8/8 baseline with uniform phase stops."""
+    x_flat.bind_dynamic(0, T_DYN)
+    x_mixed.bind_dynamic(0, T_DYN)
+    post.bind_dynamic(0, T_DYN)
+    x_norm_scale.bind_dynamic(0, T_DYN)
+    inv_rms.bind_dynamic(0, T_PAD_DYN)
+    mixes_raw.bind_dynamic(0, T_PAD_DYN)
+    pre_val_store.bind_dynamic(0, T_PAD_DYN)
+    xg_buf.bind_dynamic(0, T_PAD_DYN)
+    ffn_inv_rms_buf.bind_dynamic(0, T_PAD_DYN)
+    xn_scale_buf.bind_dynamic(0, T_PAD_DYN)
+
+    sync_workspace = pl.create_tensor(
+        [FUSED_SOFT_SYNC_WORDS],
+        dtype=pl.INT32,
+        init_value=0,
+    )
+    _tag_test_tensors(
+        x_flat,
+        inv_rms,
+        mixes_raw,
+        hc_base,
+        norm_w,
+        x_mixed,
+        pre_val_store,
+        post,
+        xg_buf,
+        ffn_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+    )
+    pl.dump_tag(sync_workspace)
+    ready_tid = pl.system.task_dummy(deps=[])
+    if False:
+        _sync_workspace_specialize = pl.create_tensor(
+            [FUSED_SOFT_SYNC_WORDS],
+            dtype=pl.INT32,
+            init_value=0,
+        )
+        (
+            x_mixed,
+            pre_val_store,
+            post,
+            xg_buf,
+            ffn_inv_rms_buf,
+            xn_scale_buf,
+            x_norm_scale,
+        ) = fused_pre_norm_baseline_debug_cce(
+            x_mixed,
+            x_flat,
+            inv_rms,
+            mixes_raw,
+            hc_base,
+            norm_w,
+            pre_val_store,
+            post,
+            xg_buf,
+            ffn_inv_rms_buf,
+            xn_scale_buf,
+            x_norm_scale,
+            _sync_workspace_specialize,
+            scale0,
+            scale1,
+            num_tokens,
+            stop_after,
+        )
+    (
+        (
+            x_mixed,
+            pre_val_store,
+            post,
+            xg_buf,
+            ffn_inv_rms_buf,
+            xn_scale_buf,
+            x_norm_scale,
+        ),
+        _fused_tid,
+    ) = pl.spmd_submit(
+        self.fused_pre_norm_baseline_debug_cce,  # noqa: F821 - materialized as a @pl.program method by @pl.jit
+        x_mixed,
+        x_flat,
+        inv_rms,
+        mixes_raw,
+        hc_base,
+        norm_w,
+        pre_val_store,
+        post,
+        xg_buf,
+        ffn_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+        sync_workspace,
+        scale0,
+        scale1,
+        num_tokens,
+        stop_after,
+        core_num=FUSED_AIV_CORES,
+        sync_start=True,
+        deps=[ready_tid],
+    )
+    _tag_test_tensors(
+        x_flat,
+        inv_rms,
+        mixes_raw,
+        hc_base,
+        norm_w,
+        x_mixed,
+        pre_val_store,
+        post,
+        xg_buf,
+        ffn_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+    )
+    return (
+        x_mixed,
+        pre_val_store,
+        post,
+        xg_buf,
+        ffn_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+    )
+
+
 def golden_fused_pre_norm(tensors):
     """Independent Torch reference that preserves poison in unwritten rows."""
     import torch
@@ -704,14 +1083,19 @@ def poison_aware_allclose(actual, expected, *, rtol=1e-3, atol=1e-3, **_):
 
 __all__ = [
     "FUSED_AIV_CORES",
+    "FUSED_SOFT_SYNC_COUNTERS",
     "FUSED_SOFT_SYNC_WORDS",
-    "SOFT_SYNC_SLOT_INT32",
+    "SOFT_SYNC_COUNTER_INT32",
     "STOP_AFTER_BARRIER1",
     "STOP_AFTER_BARRIER2",
     "STOP_FULL",
     "STOP_MIX_BEFORE_BARRIER2",
     "STOP_SPLIT_BEFORE_BARRIER1",
     "SUPPORTED_PLATFORMS",
+    "fused_pre_norm_baseline_cce",
+    "fused_pre_norm_baseline_debug_cce",
+    "fused_pre_norm_baseline_debug_test",
+    "fused_pre_norm_baseline_test",
     "fused_pre_norm_cce",
     "fused_pre_norm_debug_cce",
     "fused_pre_norm_debug_test",
@@ -758,6 +1142,15 @@ if __name__ == "__main__":
         help="use the debug entry and stop at the selected phase boundary",
     )
     parser.add_argument(
+        "--barrier-policy",
+        choices=("dense", "baseline"),
+        default="dense",
+        help=(
+            "select the experimental dense 4/8 target or the test-only "
+            "atomic 8/8 baseline"
+        ),
+    )
+    parser.add_argument(
         "--dump-args",
         nargs="?",
         const=1,
@@ -779,12 +1172,20 @@ if __name__ == "__main__":
         debug_stop = (
             None if args.debug_stop is None else debug_stops[args.debug_stop]
         )
-        result = run_jit(
-            fn=(
+        if args.barrier_policy == "baseline":
+            test_fn = (
+                fused_pre_norm_baseline_test
+                if debug_stop is None
+                else fused_pre_norm_baseline_debug_test
+            )
+        else:
+            test_fn = (
                 fused_pre_norm_test
                 if debug_stop is None
                 else fused_pre_norm_debug_test
-            ),
+            )
+        result = run_jit(
+            fn=test_fn,
             specs=build_tensor_specs(
                 t_dim,
                 num_tokens,

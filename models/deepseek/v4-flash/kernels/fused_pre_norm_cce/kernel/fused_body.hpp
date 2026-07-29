@@ -19,11 +19,15 @@
 #include "mix_x_generated.hpp"
 #include "split_pre_post_generated.hpp"
 
+#ifdef __PTO_AUTO__
+#error "fused_pre_norm soft SYNCALL requires the manual extern build path"
+#endif
+
 namespace deepseek_fused_pre_norm {
 
 // This entry is a pure-AIV extern. On Ascend A2/A3 it must be launched as one
-// synchronously-started 8-AIV wave. Every lane reaches both soft barriers,
-// including lanes with no logical work in the surrounding phase.
+// synchronously-started 8-AIV wave. Each soft barrier is called by the dense
+// prefix of logical lanes that covers both sides of that dependency edge.
 constexpr int32_t kAivLanes = 8;
 constexpr int64_t kTokenTile = 8;
 constexpr int64_t kMixSlicesPerTokenTile = 4;
@@ -44,7 +48,7 @@ enum TensorArg : int32_t {
   kFfnInvRms = 9,    // FP32 [T_PAD, 1]
   kXnScale = 10,     // FP32 [T_PAD, 1]
   kXNormScale = 11,  // FP32 [T, 1]
-  kSyncWorkspace = 12,  // INT32 [kSoftSyncWords], per-grid InOut
+  kSyncWorkspace = 12,  // INT32 [kSoftSyncWorkspaceWords], per-grid InOut
   kTensorArgCount = 13,
 };
 
@@ -68,23 +72,37 @@ enum class StopAfter : int32_t {
   kFull = 4,
 };
 
+// The normal fused entry uses the participant-minimal dense-prefix candidate.
+// The test-only correctness baseline forces every existing barrier to use all
+// 8 launched AIV lanes. Both remain experimental until PTO-ISA's finite poll
+// timeout is fail-closed; the policy is a template argument so neither kernel
+// contains a runtime mode branch.
+enum class BarrierPolicy : int32_t {
+  kDenseTarget = 0,
+  kAtomicEightWayBaseline = 1,
+};
+
+static_assert(
+    kAivLanes == 8,
+    "the atomic 8/8 correctness baseline requires an 8-AIV launch");
+
 #ifdef __DAV_C220_VEC__
-// The generated phase bodies currently use less than 65 KiB of UB. Keep the
-// software-barrier scratch below PTO's fixed [184 KiB, 192 KiB) temporary
-// region and far above the generated bodies' current high-water mark.
-constexpr uint32_t kSoftSyncUbAddr = 176U * 1024U;
-constexpr int32_t kSoftSyncWords =
-    kAivLanes * pto::SYNCALL_SOFT_SLOT_INT32;
 constexpr uint64_t kA2A3DcciLineBytes = 64U;
+constexpr int32_t kSoftSyncCounterWords =
+    pto::SYNCALL_SOFT_WORKSPACE_INT32;
+constexpr int32_t kBarrier1OffsetWords = 0;
+constexpr int32_t kBarrier2OffsetWords = kSoftSyncCounterWords;
+constexpr int32_t kSoftSyncWorkspaceWords =
+    2 * kSoftSyncCounterWords;
 constexpr int64_t kPreValueWidth = 8;
 constexpr int64_t kHiddenDim = 4096;
 constexpr int64_t kMixSliceWidth = 1024;
 
-static_assert(kSoftSyncUbAddr % kA2A3DcciLineBytes == 0U);
 static_assert(
-    kSoftSyncUbAddr +
-            static_cast<uint32_t>(kSoftSyncWords * sizeof(int32_t)) <=
-        pto::TMP_UB_OFFSET);
+    kSoftSyncCounterWords * sizeof(int32_t) == kA2A3DcciLineBytes);
+static_assert(
+    (kBarrier2OffsetWords * sizeof(int32_t)) % kA2A3DcciLineBytes == 0U);
+static_assert(kSoftSyncWorkspaceWords == 32);
 static_assert(
     kA2A3DcciLineBytes != 0U &&
     (kA2A3DcciLineBytes & (kA2A3DcciLineBytes - 1U)) == 0U);
@@ -184,14 +202,19 @@ static __aicore__ __attribute__((always_inline)) void acquire_x_mixed(
 }
 
 static __aicore__ __attribute__((always_inline)) void soft_sync_aiv(
-    __gm__ int32_t *gm_workspace, int32_t participant_idx) {
-  __ubuf__ int32_t *ub_workspace =
-      reinterpret_cast<__ubuf__ int32_t *>(kSoftSyncUbAddr);
+    __gm__ int32_t *workspace_base,
+    int32_t offset_words,
+    int32_t participants) {
+  pto::GlobalTensor<
+      int32_t,
+      pto::Shape<>,
+      pto::Stride<>
+  > workspace(workspace_base + offset_words);
 
-  pipe_barrier(PIPE_ALL);
-  pto::SYNCALL_SOFT_AIV_BARRIER(
-      gm_workspace, ub_workspace, kAivLanes, participant_idx);
-  pipe_barrier(PIPE_ALL);
+  pto::SYNCALL<
+      pto::SyncAllMode::Soft,
+      pto::SyncCoreType::AIVOnly
+  >(workspace, participants);
 }
 #endif  // __DAV_C220_VEC__
 
@@ -238,7 +261,23 @@ compute_ffn_work(int64_t num_tokens, int64_t tokens) {
   return static_cast<int32_t>(active_gate_tokens);
 }
 
-template <StopAfter Stop>
+template <BarrierPolicy Policy>
+static __aicore__ __attribute__((always_inline)) int32_t
+select_barrier_participants(int32_t dense_participants) {
+  static_assert(
+      Policy == BarrierPolicy::kDenseTarget ||
+          Policy == BarrierPolicy::kAtomicEightWayBaseline,
+      "unsupported fused_pre_norm barrier policy");
+  if constexpr (Policy == BarrierPolicy::kAtomicEightWayBaseline) {
+    return dense_participants > 0 ? kAivLanes : 0;
+  }
+  return dense_participants;
+}
+
+template <
+    StopAfter Stop,
+    BarrierPolicy Policy = BarrierPolicy::kDenseTarget
+>
 static __aicore__ __attribute__((always_inline)) void
 run_fused_pre_norm(__gm__ int64_t *args) {
 #ifdef __DAV_C220_VEC__
@@ -252,6 +291,20 @@ run_fused_pre_norm(__gm__ int64_t *args) {
   const int64_t num_tokens =
       static_cast<int64_t>(static_cast<int32_t>(args[kNumTokens]));
   const int32_t ffn_work = compute_ffn_work(num_tokens, tokens);
+  const int32_t active_split =
+      split_work < kAivLanes ? split_work : kAivLanes;
+  const int32_t active_mix =
+      mix_work < kAivLanes ? mix_work : kAivLanes;
+  const int32_t active_ffn =
+      ffn_work < kAivLanes ? ffn_work : kAivLanes;
+  const int32_t dense_barrier1_participants =
+      active_split > active_mix ? active_split : active_mix;
+  const int32_t dense_barrier2_participants =
+      active_mix > active_ffn ? active_mix : active_ffn;
+  const int32_t barrier1_participants =
+      select_barrier_participants<Policy>(dense_barrier1_participants);
+  const int32_t barrier2_participants =
+      select_barrier_participants<Policy>(dense_barrier2_participants);
 
   __gm__ bfloat16_t *x_mixed = tensor_data<bfloat16_t>(args, kXMixed);
   __gm__ float *x_flat = tensor_data<float>(args, kXFlat);
@@ -273,7 +326,7 @@ run_fused_pre_norm(__gm__ int64_t *args) {
   const float scale1 = unpack_float_scalar(args, kScale1);
 
   // Preserve the standalone split_pre_post logical block mapping. Physical
-  // lanes with lane >= split_work do no work but still reach barrier 1.
+  // lanes with lane >= split_work do no work in this phase.
   for (int32_t logical_block = lane; logical_block < split_work;
        logical_block += kAivLanes) {
     deepseek_fused_pre_norm_split_generated::split_pre_post(
@@ -288,7 +341,10 @@ run_fused_pre_norm(__gm__ int64_t *args) {
   // Publish this lane's contiguous 8x8 FP32 tiles before mix_x repartitions
   // work by (token tile, 1024-wide D slice).
   publish_pre_value(pre_value, lane, split_work);
-  soft_sync_aiv(sync_workspace, lane);
+  if (barrier1_participants > 0 && lane < barrier1_participants) {
+    soft_sync_aiv(
+        sync_workspace, kBarrier1OffsetWords, barrier1_participants);
+  }
 
   if constexpr (Stop == StopAfter::kAfterBarrier1) {
     return;
@@ -312,7 +368,10 @@ run_fused_pre_norm(__gm__ int64_t *args) {
   // A mix task writes one 1024-wide BF16 slice in each of 8 rows. Publish
   // those strided slices before ffn_norm reloads complete 4096-element rows.
   publish_x_mixed(x_mixed, lane, mix_work);
-  soft_sync_aiv(sync_workspace, lane);
+  if (barrier2_participants > 0 && lane < barrier2_participants) {
+    soft_sync_aiv(
+        sync_workspace, kBarrier2OffsetWords, barrier2_participants);
+  }
 
   if constexpr (Stop == StopAfter::kAfterBarrier2) {
     return;
@@ -321,8 +380,8 @@ run_fused_pre_norm(__gm__ int64_t *args) {
   acquire_x_mixed(x_mixed, lane, ffn_work);
 
   // ffn_norm preserves the gate's clamp/round-to-16/clamp-to-T semantics.
-  // With num_tokens=0 this is a zero-trip loop after all 8 lanes have crossed
-  // both barriers; T=128 can require multiple logical tokens per AIV lane.
+  // With num_tokens=0 this is a zero-trip loop after all active mix lanes have
+  // crossed barrier 2; T=128 can require multiple logical tokens per AIV lane.
   for (int32_t logical_block = lane; logical_block < ffn_work;
        logical_block += kAivLanes) {
     deepseek_fused_pre_norm_ffn_generated::ffn_norm(

@@ -1143,6 +1143,44 @@ def audit_fused_pre_norm_codegen(work_dir):
         )
         return rest[: next_header.start()] if next_header else rest
 
+    def task_params(name):
+        block = task_block(name)
+        params = re.findall(
+            r"\bL0TaskArgs\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
+            block,
+        )
+        if len(params) != 1:
+            raise RuntimeError(
+                "fused-pre-norm ABI audit expected exactly one L0TaskArgs "
+                f"object for {name}, got {params} in {orch_path}",
+            )
+        return block, params[0]
+
+    def submitted_task_id(name):
+        block, params = task_params(name)
+        submits = re.findall(
+            r"\bTaskOutputTensors\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+            r"rt_submit(?:_[A-Za-z0-9_]+)?_task\s*"
+            rf"\([^;]*\b{re.escape(params)}\b\s*\)\s*;",
+            block,
+        )
+        if len(submits) != 1:
+            raise RuntimeError(
+                "fused-pre-norm ABI audit expected exactly one submit for "
+                f"{name}, got {submits} in {orch_path}",
+            )
+        task_ids = re.findall(
+            r"\bPTO2TaskId\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+            rf"{re.escape(submits[0])}\.task_id\(\)\s*;",
+            block,
+        )
+        if len(task_ids) != 1:
+            raise RuntimeError(
+                "fused-pre-norm ABI audit expected exactly one submitted "
+                f"task id for {name}, got {task_ids} in {orch_path}",
+            )
+        return task_ids[0]
+
     def tensor_args(name):
         return [
             re.sub(r"_inline\d+.*$", "", arg.removeprefix("ext_"))
@@ -1195,29 +1233,165 @@ def audit_fused_pre_norm_codegen(work_dir):
                 f"{task_name}: expected prefix {expected_prefix}, got {actual}",
             )
 
-    fused_block = task_block("fused_pre_norm_cce")
-    for required in (
-        ".launch_spec.set_block_num(8);",
-        ".launch_spec.set_require_sync_start(true);",
-        ".set_dependencies(",
-        ".dump(",
-    ):
-        if required not in fused_block:
+    fused_block, fused_params = task_params("fused_pre_norm_cce")
+
+    def require_task_call(block, params, method, expected_arg, task_name):
+        args = [
+            re.sub(r"\s+", "", arg)
+            for arg in re.findall(
+                rf"\b{re.escape(params)}\.{re.escape(method)}\(([^)]*)\)\s*;",
+                block,
+            )
+        ]
+        if args != [expected_arg]:
             raise RuntimeError(
-                f"fused-pre-norm ABI audit missing {required!r} in {orch_path}",
+                "fused-pre-norm ABI audit expected exactly "
+                f"{params}.{method}({expected_arg}) for {task_name}, "
+                f"got {args} in {orch_path}",
             )
 
-    if re.search(
-        r"\.add_inout\(\s*sync_workspace(?:_inline\d+)?\s*\);",
+    require_task_call(
         fused_block,
-    ) is None:
+        fused_params,
+        "launch_spec.set_block_num",
+        "8",
+        "fused_pre_norm_cce",
+    )
+    require_task_call(
+        fused_block,
+        fused_params,
+        "launch_spec.set_require_sync_start",
+        "true",
+        "fused_pre_norm_cce",
+    )
+    require_task_call(
+        fused_block,
+        fused_params,
+        "set_allow_early_resolve",
+        "true",
+        "fused_pre_norm_cce",
+    )
+    for producer_name in ("hc_pre_rms", "hc_pre_linear"):
+        producer_block, producer_params = task_params(producer_name)
+        require_task_call(
+            producer_block,
+            producer_params,
+            "set_allow_early_resolve",
+            "true",
+            producer_name,
+        )
+
+    workspace_shapes = re.findall(
+        r"\buint32_t\s+"
+        r"(sync_workspace(?:_inline\d+)?)_ci_shapes\[1\]\s*=\s*\{32\}\s*;",
+        source,
+    )
+    if len(workspace_shapes) != 1:
         raise RuntimeError(
-            "fused-pre-norm ABI audit requires sync_workspace to be InOut in "
-            f"{orch_path}",
+            "fused-pre-norm ABI audit expected exactly one INT32[32] "
+            f"sync_workspace declaration, got {workspace_shapes} in {orch_path}",
+        )
+    workspace = workspace_shapes[0]
+    workspace_ci = f"{workspace}_ci"
+    workspace_ci_shapes = f"{workspace_ci}_shapes"
+
+    create_info_matches = re.findall(
+        rf"\bTensorCreateInfo\s+{re.escape(workspace_ci)}\s*\(\s*"
+        rf"{re.escape(workspace_ci_shapes)}\s*,\s*1\s*,\s*"
+        r"DataType::INT32\s*\)\s*;",
+        source,
+    )
+    if len(create_info_matches) != 1:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires sync_workspace to be a fresh "
+            f"contiguous INT32[32] create-info output in {orch_path}",
+        )
+    init_matches = re.findall(
+        rf"\b{re.escape(workspace_ci)}\.set_initial_value\(\s*0\s*\)\s*;",
+        source,
+    )
+    if len(init_matches) != 1:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires exactly one zero initializer "
+            f"for sync_workspace in {orch_path}",
+        )
+
+    workspace_allocations = []
+    for allocation, arguments in re.findall(
+        r"\bTaskOutputTensors\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+        r"alloc_tensors\(([^;]*)\)\s*;",
+        source,
+        flags=re.DOTALL,
+    ):
+        allocation_args = [arg.strip() for arg in arguments.split(",")]
+        if workspace_ci in allocation_args:
+            workspace_allocations.append(
+                (allocation, allocation_args.index(workspace_ci)),
+            )
+    if len(workspace_allocations) != 1:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires one fresh alloc_tensors source "
+            f"for sync_workspace, got {workspace_allocations} in {orch_path}",
+        )
+    workspace_allocation, workspace_index = workspace_allocations[0]
+    materializations = re.findall(
+        rf"\bconst\s+Tensor\s*&\s*{re.escape(workspace)}\s*=\s*"
+        rf"{re.escape(workspace_allocation)}\.get_ref\(\s*(\d+)\s*\)\s*;",
+        source,
+    )
+    if materializations != [str(workspace_index)]:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires sync_workspace to be the "
+            "unsliced tensor returned directly by alloc_tensors, got "
+            f"{materializations} in {orch_path}",
+        )
+    if re.search(
+        rf"\b{re.escape(workspace)}\s*\.\s*(?:view|reshape|slice)\s*\(",
+        source,
+    ):
+        raise RuntimeError(
+            "fused-pre-norm ABI audit forbids a view/slice/reshape of "
+            f"sync_workspace in {orch_path}",
+        )
+
+    # TensorCreateInfo currently does not print start_offset in orchestration:
+    # its runtime constructor owns the start_offset=0 invariant. If a future
+    # generator starts emitting the field, reject every non-zero value here.
+    visible_start_offsets = re.findall(
+        rf"\b(?:{re.escape(workspace)}|{re.escape(workspace_ci)})"
+        r"\.start_offset\s*=\s*([^;]+)\s*;",
+        source,
+    )
+    visible_start_offsets += re.findall(
+        rf"\b(?:{re.escape(workspace)}|{re.escape(workspace_ci)})"
+        r"\.set_start_offset\(\s*([^)]*)\)\s*;",
+        source,
+    )
+    if any(
+        re.fullmatch(r"0[uUlL]*", value.strip()) is None
+        for value in visible_start_offsets
+    ):
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires visible sync_workspace "
+            f"start_offset values to be zero, got {visible_start_offsets} "
+            f"in {orch_path}",
+        )
+
+    workspace_add_kinds = re.findall(
+        rf"\b{re.escape(fused_params)}\.add_"
+        rf"(input|output|inout|no_dep)\(\s*{re.escape(workspace)}\s*\)\s*;",
+        fused_block,
+    )
+    if workspace_add_kinds != ["inout"]:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires exactly one full, fresh "
+            "sync_workspace add_inout and no second registration, got "
+            f"{workspace_add_kinds} in {orch_path}",
         )
 
     if re.search(
-        r"\.dump\([^;]*sync_workspace(?:_inline\d+)?[^;]*\);",
+        rf"\b{re.escape(fused_params)}\.dump\([^;]*"
+        rf"\b{re.escape(workspace)}\b[^;]*\)\s*;",
         fused_block,
     ) is None:
         raise RuntimeError(
@@ -1225,18 +1399,46 @@ def audit_fused_pre_norm_codegen(work_dir):
             f"task dump set in {orch_path}",
         )
 
-    workspace_create_checks = (
-        r"sync_workspace(?:_inline\d+)?_ci_shapes\[1\]\s*=\s*\{64\};",
-        r"TensorCreateInfo\s+sync_workspace(?:_inline\d+)?_ci"
-        r"\([^;]*DataType::INT32[^;]*\);",
-        r"sync_workspace(?:_inline\d+)?_ci\.set_initial_value\(0\);",
+    dependency_calls = re.findall(
+        rf"\b{re.escape(fused_params)}\.set_dependencies\(\s*"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*;",
+        fused_block,
     )
-    for pattern in workspace_create_checks:
-        if re.search(pattern, source) is None:
-            raise RuntimeError(
-                "fused-pre-norm ABI audit found an invalid soft-sync workspace "
-                f"declaration for pattern {pattern!r} in {orch_path}",
-            )
+    if len(dependency_calls) != 1:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit expected exactly one dependency list "
+            f"for fused_pre_norm_cce, got {dependency_calls} in {orch_path}",
+        )
+    deps_array, deps_count = dependency_calls[0]
+    deps_capacity = re.findall(
+        rf"\bPTO2TaskId\s+{re.escape(deps_array)}\[(\d+)\]\s*;",
+        fused_block,
+    )
+    deps_count_init = re.findall(
+        rf"\buint32_t\s+{re.escape(deps_count)}\s*=\s*(\d+)\s*;",
+        fused_block,
+    )
+    deps = re.findall(
+        rf"\b{re.escape(deps_array)}\[\s*{re.escape(deps_count)}\+\+\s*\]"
+        r"\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;",
+        fused_block,
+    )
+    expected_deps = [
+        submitted_task_id("hc_pre_rms"),
+        submitted_task_id("hc_pre_linear"),
+    ]
+    if (
+        deps_capacity != ["2"]
+        or deps_count_init != ["0"]
+        or deps != expected_deps
+    ):
+        raise RuntimeError(
+            "fused-pre-norm ABI audit expected exactly the hc_pre_rms and "
+            "hc_pre_linear submitted task ids as dependencies, got "
+            f"capacity={deps_capacity}, count_init={deps_count_init}, "
+            f"deps={deps}, expected={expected_deps} in {orch_path}",
+        )
 
     if not (
         task_header("dispatch_gather").start()
