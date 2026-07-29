@@ -370,12 +370,14 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             init_value=init_hidden_states,
         ),
         # One vocab shard per DP rank: card r carries a copy of shard
-        # r % TP_SIZE, matching how resident args are handed out per rank.
+        # r % TP_SIZE, matching how resident args are handed out per rank. Keep
+        # each rank-local shard on its consuming card across dispatches.
         TensorSpec(
             "lm_head_weight",
             [DP_SIZE, VOCAB_PER_TP, D],
             torch.bfloat16,
             init_value=init_lm_head_weight,
+            resident="stacked",
         ),
         TensorSpec(
             "logits",

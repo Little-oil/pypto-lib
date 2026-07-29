@@ -1384,6 +1384,7 @@ def build_tensor_specs(
         [N_RANKS, VOCAB_PER_TP, D],
         torch.bfloat16,
         init_value=init_lm_head_weight,
+        resident="stacked",
     ))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(TensorSpec(
