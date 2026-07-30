@@ -554,6 +554,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
             specs.append(ranked_spec)
 
     resident_names = replicated_attention | {
+        "kv_cache",
         "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
         "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",

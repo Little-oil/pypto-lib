@@ -493,6 +493,7 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
                 name, [N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], cache_dtype,
                 init_value=init_kv_cache,
                 is_output=True,
+                resident="stacked",
             )
             specs.append(cache_spec)
         elif name == "ori_block_table":
