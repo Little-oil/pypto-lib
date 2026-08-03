@@ -1,0 +1,4 @@
+interface:
+  display_name: "Critical Path"
+  short_description: "Find operator critical paths and dispatch blockers"
+  default_prompt: "Use $critical-path to analyze this operator and report its performance gaps and dispatch blockers."

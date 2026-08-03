@@ -1,0 +1,4 @@
+interface:
+  display_name: "Early Dispatch"
+  short_description: "Enable and verify early dispatch for small operators"
+  default_prompt: "Use $early-dispatch to enable and verify early dispatch for this small operator."

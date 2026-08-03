@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Dummy"
+  short_description: "Reserve early dispatch for a critical sibling"
+  default_prompt: "Use $add-dummy to stop this sibling from consuming the critical operator early-dispatch window."
