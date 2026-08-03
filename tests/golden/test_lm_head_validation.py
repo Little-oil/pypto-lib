@@ -104,6 +104,25 @@ def test_logits_reference_rejects_nan():
     assert "NaN=1" in detail
 
 
+@pytest.mark.parametrize("nonfinite", [torch.nan, torch.inf])
+def test_logits_reference_rejects_nonfinite_reference(nonfinite):
+    tp_size, hidden, weights, row_indices, expected = _fixture()
+    actual_hidden = hidden.clone()
+    actual_hidden[0, 0, 0] = nonfinite
+    cmp = device_hidden_logits_allclose(
+        tp_size,
+        atol=1e-5,
+        rtol=1e-5,
+        max_error_ratio=0.0,
+        max_e2e_abs_diff=0.5,
+    )
+
+    ok, detail = _compare(cmp, expected, expected, actual_hidden, weights, row_indices)
+
+    assert not ok
+    assert "non-finite LM-head reference logits" in detail
+
+
 def test_logits_reference_catches_catastrophic_upstream_error():
     tp_size, golden_hidden, weights, row_indices, expected = _fixture()
     actual_hidden = golden_hidden.clone()

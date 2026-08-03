@@ -67,6 +67,8 @@ def device_hidden_logits_allclose(
             inputs["logit_row_indices"].cpu(),
             tp_size,
         )
+        if not bool(torch.isfinite(reference).all()):
+            return False, "    non-finite LM-head reference logits"
         lm_head_ok, lm_head_detail = base_cmp(
             actual,
             reference,
