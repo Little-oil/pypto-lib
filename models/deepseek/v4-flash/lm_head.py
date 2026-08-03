@@ -33,6 +33,7 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import FLASH as M
+from lm_head_validation import compute_lm_head_logits
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -500,21 +501,12 @@ def l3_lm_head(
 def golden_lm_head(tensors):
     import torch
 
-    hidden = tensors["hidden_states"].float()
-    # Card r holds shard r % TP_SIZE, so concatenating shards in index order
-    # reproduces the global vocabulary order every owner assembles.
-    weight = tensors["lm_head_weight"].float()
-    full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
-    full_logits = []
-    for owner_rank in range(DP_SIZE):
-        selected = torch.zeros((MAX_LOGIT_ROWS, D), dtype=torch.float32)
-        for row in range(MAX_LOGIT_ROWS):
-            source_row = int(tensors["logit_row_indices"][owner_rank, row])
-            if source_row >= 0:
-                source_row = min(source_row, hidden.shape[1] - 1)
-                selected[row].copy_(hidden[owner_rank, source_row])
-        full_logits.append(torch.matmul(selected, full_weight.t()))
-    tensors["logits"][:] = torch.stack(full_logits, dim=0)
+    tensors["logits"][:] = compute_lm_head_logits(
+        tensors["hidden_states"],
+        tensors["lm_head_weight"],
+        tensors["logit_row_indices"],
+        TP_SIZE,
+    )
     if "sampled_ids" in tensors:
         tensors["sampled_ids"].zero_()
         tensors["sampled_ids"][:, :, 0] = torch.argmax(
