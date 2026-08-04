@@ -427,9 +427,21 @@ def _mtp_head_specs():
     ]
 
 
-def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
+def build_tensor_specs(
+    start_pos=0,
+    num_tokens=T,
+    ori_block_num=BLOCK_NUM,
+    output_mode="validate",
+):
     import torch
     from golden import ScalarSpec, TensorSpec
+
+    if output_mode not in ("validate", "device-resident"):
+        raise ValueError(
+            f"unsupported output_mode {output_mode!r}; expected 'validate' or 'device-resident'"
+        )
+    # Both modes use the same resident device buffers. ``main`` controls whether
+    # they are copied to host once for golden validation or remain device-only.
 
     base_tensor_specs = build_single_layer_tensor_specs(
         start_pos=start_pos, num_tokens=num_tokens, layer_id=MTP_LAYER_ID,
@@ -529,16 +541,22 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
         resident="stacked",
     )
     specs.append(lm_head_spec)
-    hidden_out_spec = TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True)
+    hidden_out_spec = TensorSpec(
+        "hidden_out", [N_RANKS, T, D], torch.bfloat16,
+        is_output=True,
+        resident="stacked",
+    )
     specs.append(hidden_out_spec)
     pre_hc_hidden_spec = TensorSpec(
         "pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32,
         is_output=True,
+        resident="stacked",
     )
     specs.append(pre_hc_hidden_spec)
     logits_spec = TensorSpec(
         "logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32,
         is_output=True,
+        resident="stacked",
     )
     specs.append(logits_spec)
     row_indices_spec = TensorSpec(
@@ -678,6 +696,8 @@ def valid_ratio_reldiff(num_tokens, diff_thd, pct_thd):
 
 
 def main():
+    import torch
+
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP packed-prefill forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument(
@@ -691,12 +711,26 @@ def main():
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T)
     parser.add_argument("--ori-block-num", type=int, default=BLOCK_NUM)
+    parser.add_argument("--seed", type=int, default=0, help="random seed for reproducible inputs and golden")
+    parser.add_argument(
+        "--output-mode",
+        choices=("validate", "device-resident"),
+        default="validate",
+        help=(
+            "validate: copy outputs to host and run golden checks; "
+            "device-resident: keep hidden/pre-HC/logits on device and skip golden/readback"
+        ),
+    )
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    print(f"[RUN] seed={args.seed}", flush=True)
+    print(f"[RUN] output_mode={args.output_mode}", flush=True)
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
@@ -707,8 +741,9 @@ def main():
             start_pos=args.start_pos,
             num_tokens=args.num_tokens,
             ori_block_num=args.ori_block_num,
+            output_mode=args.output_mode,
         ),
-        golden_fn=golden_mtp_prefill_fwd,
+        golden_fn=golden_mtp_prefill_fwd if args.output_mode == "validate" else None,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         save_data=False,

@@ -1370,6 +1370,7 @@ class TestResidentPath:
         monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "1")
         monkeypatch.setenv("PYPTO_BENCH_WARMUP", "1")
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["x"])
+        monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
         with patch.dict(
@@ -1471,6 +1472,7 @@ class TestResidentPath:
         tensors = {"w": torch.ones(2, 4)}
         # Avoid real pypto.runtime / backend by stubbing the metadata + config helpers.
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["w"])
+        monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
         with patch.dict(sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}):
@@ -1490,6 +1492,71 @@ class TestResidentPath:
         assert calls["dispatched"] == 1
         assert calls["stacked"] == [((2, 4), None)]  # identity worker_ids
         assert calls["freed"] == 1
+
+    def test_run_l3_resident_pure_out_stacked_skips_zero_upload(self, monkeypatch):
+        """A write-only stacked resident uses empty per-rank allocations."""
+        import golden.runner as R
+        from pypto.runtime import DeviceTensor
+
+        calls = {"alloc": [], "uploaded": 0, "freed": 0, "dispatched": 0}
+
+        class _FakeRT:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def alloc_stacked_tensor(self, _host, worker_ids=None):
+                calls["uploaded"] += 1
+                raise AssertionError("pure Out must not upload its host placeholder")
+
+            def alloc_tensor(self, shape, dtype, *, init=None, worker_id=0):
+                calls["alloc"].append((tuple(shape), dtype, init, worker_id))
+                return DeviceTensor(0x1000 + worker_id * 0x100, shape, dtype)
+
+            def free_stacked_tensor(self, _h):
+                calls["freed"] += 1
+
+            def free_tensor(self, _h, *, worker_id=0):
+                raise AssertionError(f"successful stacked handle must be freed as a stack: {worker_id}")
+
+            def __call__(self, *_args, config=None):
+                calls["dispatched"] += 1
+
+        class _FakeDCP:
+            def prepare(self):
+                return _FakeRT()
+
+        fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")
+        fake_mod.DistributedCompiledProgram = _FakeDCP
+
+        specs = [TensorSpec("y", [2, 4], torch.float32, is_output=True, resident="stacked")]
+        tensors = {"y": torch.zeros(2, 4)}
+        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["y"])
+        monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: {"y"})
+        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+
+        with patch.dict(sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}):
+            R._run_l3_resident(
+                compiled=_FakeDCP(),
+                tensor_specs=specs,
+                tensors=tensors,
+                scalar_specs_eff={},
+                runtime_cfg={"platform": "a2a3"},
+                golden_outputs=None,
+                rtol=1e-5,
+                atol=1e-5,
+                compare_fn={},
+            )
+
+        assert calls["uploaded"] == 0
+        assert calls["dispatched"] == 1
+        assert calls["freed"] == 1
+        assert calls["alloc"] == [
+            ((4,), torch.float32, None, 0),
+            ((4,), torch.float32, None, 1),
+        ]
 
     def test_run_l3_resident_output_reads_back(self, monkeypatch):
         """A resident+is_output spec (state buffer) is read back via copy_stacked_from
@@ -1535,6 +1602,7 @@ class TestResidentPath:
         golden = {"kv": torch.full((2, 4), 7.0)}
 
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["kv"])
+        monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
         def _fake_validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn):

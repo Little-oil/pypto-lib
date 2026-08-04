@@ -763,10 +763,57 @@ def _share_in_place(tensors: dict[str, torch.Tensor]) -> None:
         tensors[name] = t.cpu().contiguous().share_memory_()
 
 
+def _strip_ssa_suffix(name: str) -> str:
+    """Strip only a terminal ``__ssa_vN`` suffix from a compiled parameter name."""
+    base, marker, version = name.rpartition("__ssa_v")
+    return base if marker and version.isdigit() else name
+
+
 def _l3_ordered_names(compiled: Any) -> list[str]:
     """Parameter names in orchestration order (SSA suffix ``orig__ssa_vN`` -> ``orig``)."""
     param_infos, _, _ = compiled._get_metadata()
-    return [p.name.split("__ssa_")[0] for p in param_infos]
+    return [_strip_ssa_suffix(p.name) for p in param_infos]
+
+
+def _l3_pure_out_names(compiled: Any) -> set[str]:
+    """Names of write-only L3 parameters that need no resident initialization."""
+    from pypto.ir import ParamDirection
+
+    param_infos, _, _ = compiled._get_metadata()
+    normalized_names = [_strip_ssa_suffix(p.name) for p in param_infos]
+    if len(set(normalized_names)) != len(normalized_names):
+        raise ValueError("compiled L3 parameters collide after stripping SSA suffixes")
+    return {
+        name
+        for name, p in zip(normalized_names, param_infos, strict=True)
+        if p.direction == ParamDirection.Out
+    }
+
+
+def _alloc_empty_stacked_tensor(rt: Any, spec: TensorSpec) -> Any:
+    """Allocate one uninitialized shard per rank for a pure ``Out`` resident."""
+    from pypto.runtime import StackedDeviceTensor
+
+    shape = tuple(spec.shape)
+    if len(shape) < 2 or shape[0] < 1:
+        raise ValueError(
+            f"TensorSpec {spec.name!r}: resident=\"stacked\" needs shape [B, *tail], got {shape}"
+        )
+    worker_ids = tuple(range(int(shape[0])))
+    shards = []
+    try:
+        for wid in worker_ids:
+            shards.append(
+                rt.alloc_tensor(shape[1:], spec.dtype, init=None, worker_id=wid)
+            )
+        return StackedDeviceTensor(shards, shape, worker_ids)
+    except Exception:
+        for shard, wid in zip(shards, worker_ids, strict=False):
+            try:
+                rt.free_tensor(shard, worker_id=wid)
+            except Exception:  # noqa: BLE001 - preserve the allocation/construction error
+                pass
+        raise
 
 
 def _l3_run_config(runtime_cfg: dict[str, Any]) -> Any:
@@ -837,13 +884,12 @@ def _run_l3_resident(
 
     Routes through :meth:`DistributedCompiledProgram.prepare` — the only path
     that can build worker-resident :class:`~pypto.runtime.DeviceTensor` buffers.
-    Each resident spec is uploaded once via ``rt.alloc_tensor(init=...)`` and
-    reused across the validation dispatch and every benchmark round, so its
-    weight is never re-uploaded (H2D) or read back (D2H); per-call IO stays
-    shared-memory host tensors reused in place. A resident spec that is also an
-    output is a read-write state buffer (e.g. a KV cache): uploaded once as its
-    initial state, updated in place on-device, and read back once before
-    validation via :func:`_readback_resident_outputs`.
+    Each resident input / ``InOut`` spec is uploaded once via
+    ``rt.alloc_tensor(init=...)`` and reused across the validation dispatch and
+    every benchmark round. A pure ``Out`` resident is allocated uninitialized,
+    because its host tensor is only an output destination and uploading its
+    zero-filled placeholder would be wasted work. Resident outputs are read back
+    once before golden validation via :func:`_readback_resident_outputs`.
 
     When :func:`_bench_enabled` (``PYPTO_BENCH``), the resident weights are reused
     for :func:`_bench_loop_sizes` timed rounds. This cannot go through
@@ -877,6 +923,7 @@ def _run_l3_resident(
     _share_in_place(tensors)
 
     ordered_names = _l3_ordered_names(compiled)
+    pure_out_names = _l3_pure_out_names(compiled)
     run_config = _l3_run_config(runtime_cfg)
     resident_specs = [s for s in tensor_specs if s.is_resident]
     bench = _bench_enabled()
@@ -913,21 +960,25 @@ def _run_l3_resident(
                 for s in resident_specs:
                     if s.resident == "stacked":
                         # Leading-dim sharded: shard i of a [world_size, *tail] weight
-                        # uploaded to card i (identity worker_ids), matching a
+                        # placed on card i (identity worker_ids), matching a
                         # ``for r: child(x[r], device=r)`` orchestrator.
-                        if not hasattr(rt, "alloc_stacked_tensor"):
+                        if s.name in pure_out_names:
+                            handle = _alloc_empty_stacked_tensor(rt, s)
+                        elif not hasattr(rt, "alloc_stacked_tensor"):
                             raise ValueError(
                                 f"TensorSpec {s.name!r}: resident=\"stacked\" needs a pypto runtime "
                                 f"exposing DistributedWorker.alloc_stacked_tensor; this runtime lacks it."
                             )
-                        handle = rt.alloc_stacked_tensor(tensors[s.name])
+                        else:
+                            handle = rt.alloc_stacked_tensor(tensors[s.name])
                         resident_handles.append((s.name, handle, True, 0))
                     else:
                         # Whole-tensor resident on a single card: resident is the int
                         # worker id (0, 1, ...) the consuming kernel is dispatched to.
                         wid = int(s.resident)
+                        init = None if s.name in pure_out_names else tensors[s.name]
                         handle = rt.alloc_tensor(
-                            tuple(s.shape), s.dtype, init=tensors[s.name], worker_id=wid
+                            tuple(s.shape), s.dtype, init=init, worker_id=wid
                         )
                         resident_handles.append((s.name, handle, False, wid))
                 resident_args = {name: handle for name, handle, _, _ in resident_handles}
