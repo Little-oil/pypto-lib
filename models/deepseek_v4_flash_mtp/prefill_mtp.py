@@ -87,6 +87,32 @@ MTP_LAYER_ID = M.num_hidden_layers
 MTP_MOE_EPOCH = 1
 LM_HEAD_COMM_EPOCH = 1
 
+# Static parameters to keep device-resident, sharded per MTP rank.  Every tensor
+# is laid out as ``[N_RANKS, *tail]`` and consumed as ``weight[r]`` on
+# ``device=r``, so ``resident="stacked"`` uploads shard ``r`` once to that card
+# and reuses it across validation, warmup, and timed rounds.  Dynamic activations,
+# request ids, and block/slot metadata deliberately remain per-call.
+# ``lm_head_weight`` is constructed separately below and is resident as well.
+RESIDENT_WEIGHT_NAMES = frozenset({
+    # MTP projection.
+    "enorm_w", "hnorm_w",
+    "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
+    "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
+    # SWA attention and RoPE constants.
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
+    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "freqs_cos", "freqs_sin", "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+    # MoE weights and the static token-to-expert lookup table.
+    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+    "gate_w", "gate_bias", "tid2eid",
+    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+    "routed_w2", "routed_w2_scale",
+    "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
+    "shared_w2", "shared_w2_scale",
+    # MTP HC head and final norm.
+    "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
+})
+
 
 @pl.jit(auto_scope=False)
 def mtp_prefill_fwd(
@@ -534,6 +560,12 @@ def build_tensor_specs(
             specs.append(slot_mapping_spec)
         else:
             specs.append(_ranked(base[name], torch))
+
+    # Keep static weights on their consuming cards.  Apply this after assembly
+    # so the policy is independent of which component builder produced a spec.
+    for spec in specs:
+        if spec.name in RESIDENT_WEIGHT_NAMES:
+            spec.resident = "stacked"
 
     lm_head_spec = TensorSpec(
         "lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16,
