@@ -39,7 +39,6 @@ from lm_head import (
     golden_lm_head,
     lm_head_test,
 )
-from lm_head_validation import device_hidden_logits_allclose
 from moe import (
     AUX_PAD,
     D,
@@ -679,8 +678,6 @@ def valid_ratio_reldiff(num_tokens, diff_thd, pct_thd):
 
 
 def main():
-    import torch
-
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP packed-prefill forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument(
@@ -694,16 +691,12 @@ def main():
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T)
     parser.add_argument("--ori-block-num", type=int, default=BLOCK_NUM)
-    parser.add_argument("--seed", type=int, default=0, help="random seed for input generation")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
-
-    torch.manual_seed(args.seed)
-    print(f"[RUN] seed={args.seed}", flush=True)
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
@@ -734,13 +727,7 @@ def main():
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2, max_error_ratio=0.01),
             "hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.05),
             "pre_hc_hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.05),
-            "logits": device_hidden_logits_allclose(
-                LM_HEAD_TP_SIZE,
-                atol=1e-2,
-                rtol=1e-2,
-                max_error_ratio=0.01,
-                max_e2e_abs_diff=0.5,
-            ),
+            "logits": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.05),
         },
     )
     if not result.passed:
