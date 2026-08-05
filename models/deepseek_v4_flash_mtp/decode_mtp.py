@@ -463,7 +463,7 @@ def _projection_specs():
         ),
         "tail_pre_hc_pool": TensorSpec(
             "tail_pre_hc_pool", [N_RANKS, B, HC_MULT, D], torch.float32,
-            init_value=init_tail_pre_hc_pool, is_output=True,
+            init_value=init_tail_pre_hc_pool, is_output=True, resident="stacked",
         ),
         "accepted_counts": TensorSpec(
             "accepted_counts", [N_RANKS, B], torch.int32,

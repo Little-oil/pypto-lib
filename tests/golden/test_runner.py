@@ -1320,13 +1320,20 @@ class TestResidentPath:
         assert r.passed, f"unexpected failure: {r.error}"
         l3res.assert_called_once()
 
-    def test_resident_benchmark_reuses_persistent_windows_without_runtime_reset(
+    def test_resident_benchmark_reuses_handle_and_persistent_windows(
         self, monkeypatch
     ):
-        """The resident L3 benchmark prepares its worker in persistent mode."""
+        """The resident L3 benchmark reuses one handle in persistent mode."""
         import golden.runner as R
 
-        calls = {"prepare": None, "dispatches": 0}
+        calls = {"prepare": None, "events": []}
+        state_handle = object()
+        initial_state = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        state_spec = TensorSpec(
+            "state", [2, 4], torch.float32, init_value=initial_state,
+            is_output=True, resident="stacked",
+        )
+        state_init = state_spec.create_tensor()
 
         class _FakeRT:
             def __enter__(self):
@@ -1335,8 +1342,20 @@ class TestResidentPath:
             def __exit__(self, *_a):
                 return False
 
-            def __call__(self, *_args, config=None):
-                calls["dispatches"] += 1
+            def alloc_stacked_tensor(self, host, worker_ids=None):
+                assert worker_ids is None
+                assert torch.equal(host, state_init)
+                calls["events"].append(("alloc", state_handle))
+                return state_handle
+
+            def free_stacked_tensor(self, handle):
+                assert handle is state_handle
+                calls["events"].append(("free", handle))
+
+            def __call__(self, *args, config=None):
+                assert config == "RUNCFG"
+                assert len(args) == 1
+                calls["events"].append(("dispatch", args[0]))
 
         class _FakeDCP:
             def prepare(self, *args, **kwargs):
@@ -1367,9 +1386,9 @@ class TestResidentPath:
         fake_log.current_level = lambda: "v0"
 
         monkeypatch.setenv("PYPTO_BENCH", "1")
-        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "1")
-        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "1")
-        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["x"])
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "3")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "2")
+        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["state"])
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
@@ -1383,8 +1402,8 @@ class TestResidentPath:
         ):
             result = R._run_l3_resident(
                 compiled=_FakeDCP(),
-                tensor_specs=[TensorSpec("x", [1], torch.float32)],
-                tensors={"x": torch.zeros(1)},
+                tensor_specs=[state_spec],
+                tensors={"state": state_init},
                 scalar_specs_eff={},
                 runtime_cfg={"platform": "a2a3"},
                 golden_outputs=None,
@@ -1398,7 +1417,10 @@ class TestResidentPath:
             ("RUNCFG",),
             {"persistent": True, "reset_persistent_windows": False},
         )
-        assert calls["dispatches"] == 2
+        assert [kind for kind, _ in calls["events"]] == [
+            "alloc", "dispatch", "dispatch", "dispatch", "dispatch", "dispatch", "free",
+        ]
+        assert all(handle is state_handle for _, handle in calls["events"])
 
     @staticmethod
     def _fake_dcp_module():
