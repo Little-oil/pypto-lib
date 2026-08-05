@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
+# ci: a2a3-lease-devices=3
 # ci: no-sim
 """DeepSeek-V4 MTP prefill: projection, SWA attention, MoE, HC head, RMSNorm, and LM head."""
 
@@ -727,6 +728,32 @@ def valid_ratio_reldiff(num_tokens, diff_thd, pct_thd):
     return cmp
 
 
+def _select_device_ids(candidate_device_ids, num_ranks, platform):
+    """Select the EP ranks from devices atomically leased by the CI runner.
+
+    An Ascend A3 chip exposes two consecutive logical device IDs whose AICPU
+    scheduler state is shared.  Affected runtime revisions can leave that
+    shared scheduler stalled across process teardown.  The EP2 CI case leases
+    one spare candidate so it can avoid placing both ranks on the two dies of
+    the same chip.  Exact two-device invocations retain their requested
+    topology for local testing.
+    """
+    if len(candidate_device_ids) < num_ranks:
+        raise ValueError(f"need at least {num_ranks} devices, got {candidate_device_ids}")
+
+    if platform != "a2a3" or num_ranks != 2 or len(candidate_device_ids) == num_ranks:
+        return candidate_device_ids[:num_ranks]
+
+    rank0 = candidate_device_ids[0]
+    for rank1 in candidate_device_ids[1:]:
+        if rank1 // 2 != rank0 // 2:
+            return [rank0, rank1]
+    raise ValueError(
+        "a2a3 EP2 requires candidates from two physical chips; "
+        f"got {candidate_device_ids}"
+    )
+
+
 def main():
     import torch
 
@@ -764,8 +791,9 @@ def main():
     print(f"[RUN] seed={args.seed}", flush=True)
     print(f"[RUN] output_mode={args.output_mode}", flush=True)
 
-    device_ids = [int(d) for d in args.device.split(",")]
-    assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
+    candidate_device_ids = [int(d) for d in args.device.split(",")]
+    device_ids = _select_device_ids(candidate_device_ids, N_RANKS, args.platform)
+    print(f"[RUN] device candidates={candidate_device_ids} selected={device_ids}", flush=True)
 
     result = run_jit(
         fn=l3_mtp_prefill_fwd,
@@ -781,7 +809,7 @@ def main():
         save_data=False,
         compile_cfg=dict(
             dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
         ),
         runtime_cfg=dict(
             platform=args.platform,
