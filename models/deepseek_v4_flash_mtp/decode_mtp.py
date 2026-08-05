@@ -649,16 +649,19 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         resident="stacked",
     )
     specs.append(lm_head_spec)
-    hidden_out_spec = TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True)
+    hidden_out_spec = TensorSpec(
+        "hidden_out", [N_RANKS, T, D], torch.bfloat16,
+        is_output=True, resident="stacked",
+    )
     specs.append(hidden_out_spec)
     next_hidden_spec = TensorSpec(
         "next_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32,
-        is_output=True,
+        is_output=True, resident="stacked",
     )
     specs.append(next_hidden_spec)
     logits_spec = TensorSpec(
         "logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32,
-        is_output=True,
+        is_output=True, resident="stacked",
     )
     specs.append(logits_spec)
     sampled_ids_spec = TensorSpec(
