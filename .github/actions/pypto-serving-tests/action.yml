@@ -65,8 +65,7 @@ runs:
       uses: actions/checkout@v4
       with:
         repository: hw-native-sys/pypto-serving
-        # pypto-serving#136 follows pypto-lib's flattened model directories.
-        ref: 2e6fbd950dc3eb656a9789b00701ed57324d90f8
+        ref: main
         path: ${{ inputs.pypto-serving-checkout-path }}
         submodules: recursive
         persist-credentials: false

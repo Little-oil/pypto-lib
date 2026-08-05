@@ -728,8 +728,6 @@ def valid_ratio_reldiff(num_tokens, diff_thd, pct_thd):
 
 
 def main():
-    import torch
-
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP packed-prefill forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument(
@@ -743,7 +741,6 @@ def main():
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T)
     parser.add_argument("--ori-block-num", type=int, default=BLOCK_NUM)
-    parser.add_argument("--seed", type=int, default=0, help="random seed for reproducible inputs and golden")
     parser.add_argument(
         "--output-mode",
         choices=("validate", "device-resident"),
@@ -760,8 +757,6 @@ def main():
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
-    print(f"[RUN] seed={args.seed}", flush=True)
     print(f"[RUN] output_mode={args.output_mode}", flush=True)
 
     device_ids = [int(d) for d in args.device.split(",")]
