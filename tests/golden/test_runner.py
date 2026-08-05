@@ -1496,9 +1496,20 @@ class TestResidentPath:
     def test_run_l3_resident_pure_out_stacked_skips_zero_upload(self, monkeypatch):
         """A write-only stacked resident uses empty per-rank allocations."""
         import golden.runner as R
-        from pypto.runtime import DeviceTensor
 
-        calls = {"alloc": [], "uploaded": 0, "freed": 0, "dispatched": 0}
+        calls = {
+            "alloc": [],
+            "stacked": [],
+            "uploaded": 0,
+            "freed": 0,
+            "dispatched": 0,
+        }
+
+        class _FakeStackedDeviceTensor:
+            def __init__(self, shards, full_shape, worker_ids):
+                calls["stacked"].append(
+                    (len(shards), tuple(full_shape), tuple(worker_ids))
+                )
 
         class _FakeRT:
             def __enter__(self):
@@ -1513,7 +1524,7 @@ class TestResidentPath:
 
             def alloc_tensor(self, shape, dtype, *, init=None, worker_id=0):
                 calls["alloc"].append((tuple(shape), dtype, init, worker_id))
-                return DeviceTensor(0x1000 + worker_id * 0x100, shape, dtype)
+                return types.SimpleNamespace(worker_id=worker_id)
 
             def free_stacked_tensor(self, _h):
                 calls["freed"] += 1
@@ -1530,6 +1541,8 @@ class TestResidentPath:
 
         fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")
         fake_mod.DistributedCompiledProgram = _FakeDCP
+        fake_runtime = types.ModuleType("pypto.runtime")
+        fake_runtime.StackedDeviceTensor = _FakeStackedDeviceTensor
 
         specs = [TensorSpec("y", [2, 4], torch.float32, is_output=True, resident="stacked")]
         tensors = {"y": torch.zeros(2, 4)}
@@ -1537,7 +1550,13 @@ class TestResidentPath:
         monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: {"y"})
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
-        with patch.dict(sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}):
+        with patch.dict(
+            sys.modules,
+            {
+                "pypto.ir.distributed_compiled_program": fake_mod,
+                "pypto.runtime": fake_runtime,
+            },
+        ):
             R._run_l3_resident(
                 compiled=_FakeDCP(),
                 tensor_specs=specs,
@@ -1553,6 +1572,7 @@ class TestResidentPath:
         assert calls["uploaded"] == 0
         assert calls["dispatched"] == 1
         assert calls["freed"] == 1
+        assert calls["stacked"] == [(2, (2, 4), (0, 1))]
         assert calls["alloc"] == [
             ((4,), torch.float32, None, 0),
             ((4,), torch.float32, None, 1),
