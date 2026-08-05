@@ -65,11 +65,19 @@ runs:
       uses: actions/checkout@v4
       with:
         repository: hw-native-sys/pypto-serving
-        # pypto-serving#136 follows pypto-lib's flattened model directories.
-        ref: 2e6fbd950dc3eb656a9789b00701ed57324d90f8
+        # Last revision that passed the full 8-card DeepSeek resident upload.
+        ref: 0e6bc5ea2b2f490d880279584aa598db572a9fa6
         path: ${{ inputs.pypto-serving-checkout-path }}
         submodules: recursive
         persist-credentials: false
+
+    - name: Follow flattened pypto-lib model directories
+      shell: bash
+      env:
+        PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
+      run: >-
+        git -C "$PYPTO_SERVING_CHECKOUT" apply
+        "${{ github.action_path }}/pypto-serving-flat-model-dirs.patch"
 
     - name: Override pypto-serving submodule with pypto-lib under test
       shell: bash

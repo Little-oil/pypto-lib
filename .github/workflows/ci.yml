@@ -437,6 +437,10 @@ jobs:
           checkout-path: checkout
           needs-device: 'true'
           build-namespace: serving
+          # The 43-layer resident set leaves little HBM headroom. Keep the
+          # DeepSeek guard on the last PyPTO revision validated end-to-end while
+          # newer compiler changes are qualified against that footprint.
+          pypto-ref: 9a9e2a279842afa2464bd6f24e3b377e816e5003
           # Share serving's dedicated ccache so a2a3/sim entries are not evicted.
           ccache-name: ccache-serving
           pip-cache-name: pip-serving
