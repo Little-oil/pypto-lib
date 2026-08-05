@@ -213,13 +213,13 @@ jobs:
             local file="$1" label="$2"; shift 2
             echo "::group::${label}"
             # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
-            # the top. An a2a3-only override may lease spare device candidates
-            # for topology-aware rank selection. $TASK_DEVICE is the complete
-            # lent set passed to -d. The child's stdout is captured (not
-            # streamed) so the perf line can be parsed.
+            # the top; borrow that many cards with `--device-num N` (defaults to
+            # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
+            # comma-separated for N>1) and is passed straight to -d. The child's
+            # stdout is captured (not streamed) so the perf line can be parsed;
+            # the ring env above is preserved into the child.
             local ndev devnum_flag out rc perf
-            ndev=$(grep -oP '#\s*ci:\s*a2a3-lease-devices=\K[0-9]+' "$file" | head -1)
-            [ -n "$ndev" ] || ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
+            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
             ndev=${ndev:-1}
             devnum_flag=""
             [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
@@ -249,8 +249,8 @@ jobs:
             run_case "$f" "$f"
           done
           # Higher world sizes (ep4/ep8) are added manually as dedicated wraps
-          # below — run_case follows the file's default/lease marker, so ep4/ep8
-          # need their own --device-num (card pool must provide that many), e.g.:
+          # below — run_case borrows the marker's 2 cards, so ep4/ep8 need their
+          # own --device-num (card pool must provide that many cards), e.g.:
           #   task-submit --device "$DEVICE_ID" --device-num 4 --timeout 3600 --max-time 900 \
           #     --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && \
           #       PYTHONPATH=$GITHUB_WORKSPACE/checkout \
