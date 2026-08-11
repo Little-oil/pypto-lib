@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-#include "tensor.h"
+#include "../kernel/runtime_tensor_compat.hpp"
 
 #ifdef __CPU_SIM
 #ifndef __gm__
@@ -34,7 +34,7 @@ namespace {
 
 template <typename T>
 static __aicore__ __attribute__((always_inline)) __gm__ T *tensor_data(__gm__ int64_t *args, int32_t index) {
-    __gm__ Tensor *tensor = reinterpret_cast<__gm__ Tensor *>(args[index]);
+    __gm__ PyPTORuntimeTensor *tensor = reinterpret_cast<__gm__ PyPTORuntimeTensor *>(args[index]);
     return reinterpret_cast<__gm__ T *>(tensor->buffer.addr) + tensor->start_offset;
 }
 
