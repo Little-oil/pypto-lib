@@ -56,6 +56,7 @@ jobs:
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
       files: ${{ steps.check.outputs.files }}
+      run_qwen_pa_tests: ${{ steps.check.outputs.run_qwen_pa_tests }}
       run_qwen_serving_tests: ${{ steps.check.outputs.run_qwen_serving_tests }}
       run_deepseek_serving_tests: ${{ steps.check.outputs.run_deepseek_serving_tests }}
     steps:
@@ -72,10 +73,12 @@ jobs:
 
           echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
           echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
+          echo "run_qwen_pa_tests=false" >> "$GITHUB_OUTPUT"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "files=" >> "$GITHUB_OUTPUT"
+            echo "run_qwen_pa_tests=true" >> "$GITHUB_OUTPUT"
             echo "Manual runs retain the full smoke suite."
             exit 0
           fi
@@ -90,6 +93,7 @@ jobs:
                ! git merge-base --is-ancestor "$BEFORE" "${{ github.sha }}"; then
               echo "has_changes=true" >> "$GITHUB_OUTPUT"
               echo "files=" >> "$GITHUB_OUTPUT"
+              echo "run_qwen_pa_tests=true" >> "$GITHUB_OUTPUT"
               echo "Push base is unavailable; retaining the full smoke suite."
               exit 0
             fi
@@ -121,6 +125,12 @@ jobs:
             echo "has_changes=$RUNTIME_IMPACT" >> "$GITHUB_OUTPUT"
           fi
           echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
+          QWEN_PA_IMPACT=$(
+            printf '%s\n' "$CHANGED_FILES" |
+              python .github/scripts/detect_changes.py --qwen-pa-impact
+          )
+          echo "run_qwen_pa_tests=$QWEN_PA_IMPACT" >> "$GITHUB_OUTPUT"
 
           # Serving e2e jobs are model-specific and expensive. CI-infra edits
           # (.github/**) must not trigger them.
@@ -342,6 +352,170 @@ jobs:
         working-directory: checkout
         run: rm -rf build_output
 
+  qwen-pa-contract:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_qwen_pa_tests == 'true'
+    permissions:
+      contents: read
+    runs-on: [self-hosted, linux, arm64, cpu]
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'false'
+          build-namespace: qwen-pa-contract
+          pip-cache-name: pip-qwen-pa
+
+      - name: Run Qwen paged-attention CPU contracts
+        shell: bash
+        run: |
+          source activate.sh
+          PYTHONPATH="$PWD/models/qwen3_14b:$PWD" \
+            python -m pytest models/qwen3_14b/test_paged_attention_pypto.py -q
+          PYTHONPATH="$PWD" \
+            python -m pytest tests/contract/test_qwen3_14b_contract.py -q
+
+  qwen-pa-a2a3sim:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_qwen_pa_tests == 'true'
+    permissions:
+      contents: read
+    runs-on: [self-hosted, linux, arm64, cpu]
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+      PTO2_RING_DEP_POOL: 16384
+      PTO2_RING_TASK_WINDOW: 16384
+      PTO2_RING_HEAP: 1073741824
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'false'
+          build-namespace: qwen-pa-a2a3sim
+          pip-cache-name: pip-qwen-pa-sim
+
+      - name: Compile PyPTO component and integrated decode on a2a3sim
+        shell: bash
+        run: |
+          source activate.sh
+          export PYTHONPATH="$PWD/models/qwen3_14b:$PWD"
+          PYPTO_PROG_BUILD_DIR="$PWD/build_output/qwen-pa-sim/component" \
+            python models/qwen3_14b/test_paged_attention_pypto.py \
+              -p a2a3sim -d 2 \
+              --matrix pr --compile-only \
+              --matrix-json build_output/qwen-pa-sim/component-matrix.json
+          PYPTO_PROG_BUILD_DIR="$PWD/build_output/qwen-pa-sim/decode" \
+            python models/qwen3_14b/decode_fwd.py \
+              -p a2a3sim -d 2 --smoke
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf build_output
+
+  qwen-pa-device:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_qwen_pa_tests == 'true'
+    permissions:
+      contents: read
+    runs-on: [self-hosted, linux, arm64, npu]
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+      PTO2_RING_DEP_POOL: 16384
+      PTO2_RING_TASK_WINDOW: 16384
+      PTO2_RING_HEAP: 1073741824
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: qwen-pa-device
+          pip-cache-name: pip-qwen-pa-device
+
+      - name: Run PyPTO PR matrix and integrated decode
+        shell: bash
+        run: |
+          source activate.sh
+          seq_lens=1,2,127,128,129,255,256,257,511,512,513,1023,2048,3584,4095,4096,129
+          task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 3600 \
+            --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && \
+              export PYTHONPATH=$GITHUB_WORKSPACE/checkout/models/qwen3_14b:$GITHUB_WORKSPACE/checkout && \
+              PYPTO_PROG_BUILD_DIR=$GITHUB_WORKSPACE/checkout/build_output/qwen-pa-device/component \
+                python models/qwen3_14b/test_paged_attention_pypto.py \
+                  -p a2a3 -d \$TASK_DEVICE \
+                  --matrix pr \
+                  --matrix-json build_output/qwen-pa-device/component-matrix.json && \
+              PTO2_MANUAL_MAX_SEQ=4096 \
+              PYPTO_PROG_BUILD_DIR=$GITHUB_WORKSPACE/checkout/build_output/qwen-pa-device/decode \
+                python models/qwen3_14b/decode_fwd.py \
+                  -p a2a3 -d \$TASK_DEVICE \
+                  --validate-fwd --fwd-layers 1 -b 17 --seq-lens $seq_lens"
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf build_output
+
   serving-qwen:
     needs: detect-changes
     # PR-only, qwen3-14b (single card). The 8-card DeepSeek V4 run is split into
@@ -377,7 +551,7 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'true'
-          build-namespace: serving
+          build-namespace: serving-qwen
           toolchain: bundle
           # pypto-serving's NPU runners call torch.npu.mem_get_info.
           install-torch-npu: 'true'
