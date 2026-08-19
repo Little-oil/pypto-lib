@@ -35,7 +35,6 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import pypto.language as pl
-import pytest
 import torch
 
 from golden import ScalarSpec, TensorSpec, run_jit
@@ -1065,8 +1064,12 @@ def test_pass_dump_resolution_ignores_numeric_ordinals(tmp_path: Path) -> None:
     expected.write_text("pass", encoding="utf-8")
     assert _resolve_pass_dump(tmp_path, "after_ExpandMixedKernel") == expected
     (passes / "91_after_ExpandMixedKernel.py").write_text("duplicate", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="expected one"):
+    try:
         _resolve_pass_dump(tmp_path, "after_ExpandMixedKernel")
+    except RuntimeError as error:
+        assert "expected one" in str(error)
+    else:
+        raise AssertionError("duplicate pass dumps must be rejected")
 
 
 def test_production_pa_is_fused_and_exposes_block_table_dimensions_separately() -> None:
@@ -1105,8 +1108,12 @@ def test_production_pa_preserves_two_stack_prelaunch_skew() -> None:
 def test_cli_accepts_scheduler_selected_devices() -> None:
     assert _parse_args(["-p", "a2a3", "-d", "13", "--matrix", "pr"]).device == 13
     assert _parse_args(["-p", "a2a3", "-d", "0", "--matrix", "pr"]).device == 0
-    with pytest.raises(SystemExit, match="2"):
+    try:
         _parse_args(["-d", "-1"])
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError("negative device ids must be rejected")
 
 
 if __name__ == "__main__":
