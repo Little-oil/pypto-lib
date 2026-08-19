@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim    # A2/A3-only driver; a2a3sim remains available explicitly with --compile-only.
 """Focused dynamic correctness, codegen, and raw-performance driver for fused Qwen PA.
 
 The old migration harness accumulated frozen CCE oracles, release manifests,
