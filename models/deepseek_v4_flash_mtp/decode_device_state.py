@@ -181,7 +181,8 @@ def advance_decode_device_state(
         committed_position_ids: ``[T]`` positions aligned with those committed
             windows.
         next_sampled_ids: ``[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD]`` MTP LM-head
-            sampling output.  Row ``r``, column 0 is request ``r``'s next draft.
+            sampling output.  Row ``r``, column 0 is request ``r``'s next draft
+            and column 1 receives its accepted count for host reclaim.
         accepted_counts: ``[B]`` verifier result, currently 1 on rejection and
             2 when the single draft is accepted.
 
@@ -204,6 +205,7 @@ def advance_decode_device_state(
                     # position into the second row, regardless of acceptance.
                     row1 = request * S + 1
                     accepted = pl.read(accepted_counts, [request])
+                    pl.write(next_sampled_ids, [request, 1], accepted)
                     next_draft = pl.cast(
                         pl.read(next_sampled_ids, [request, 0]),
                         target_type=pl.INT64,
