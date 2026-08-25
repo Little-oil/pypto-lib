@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim    # A2/A3-only driver; a2a3sim remains available explicitly with --compile-only.
 """Focused dynamic correctness, codegen, and raw-performance driver for fused Qwen PA.
 
 The old migration harness accumulated frozen CCE oracles, release manifests,
@@ -34,7 +35,6 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import pypto.language as pl
-import pytest
 import torch
 
 from golden import ScalarSpec, TensorSpec, run_jit
@@ -53,6 +53,7 @@ from paged_attention_pypto import (
     NUM_KV_HEADS,
     PRE_LAUNCH,
     SCALE,
+    STACK_PAGES,
     STACK_TOKENS,
     TRANSFER_ROWS,
     TRANSFER_SLOTS,
@@ -1064,8 +1065,12 @@ def test_pass_dump_resolution_ignores_numeric_ordinals(tmp_path: Path) -> None:
     expected.write_text("pass", encoding="utf-8")
     assert _resolve_pass_dump(tmp_path, "after_ExpandMixedKernel") == expected
     (passes / "91_after_ExpandMixedKernel.py").write_text("duplicate", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="expected one"):
+    try:
         _resolve_pass_dump(tmp_path, "after_ExpandMixedKernel")
+    except RuntimeError as error:
+        assert "expected one" in str(error)
+    else:
+        raise AssertionError("duplicate pass dumps must be rejected")
 
 
 def test_production_pa_is_fused_and_exposes_block_table_dimensions_separately() -> None:
@@ -1073,9 +1078,11 @@ def test_production_pa_is_fused_and_exposes_block_table_dimensions_separately() 
     assert "block_table_2d = pl.reshape(block_table, [active_batch, max_blocks_per_seq])" in source
     assert "pl.tensor.read(block_table_2d, [batch," in source
     assert "base = batch * max_blocks_per_seq" not in source
+    first_cacheinvalid = source.index("pl.system.cacheinvalid()")
     pipe_drain = source.index("pl.system.fence()")
     syncall = source.index('pl.system.syncall(core_type="mix")')
-    assert pipe_drain < syncall
+    second_cacheinvalid = source.index("pl.system.cacheinvalid()", first_cacheinvalid + 1)
+    assert first_cacheinvalid < pipe_drain < syncall < second_cacheinvalid
     assert "allow_early_resolve=True" in source
     assert "def rope_qkv_pypto(" not in source
 
@@ -1091,21 +1098,49 @@ def test_production_pa_preserves_two_stack_prelaunch_skew() -> None:
     source = Path(__file__).with_name("paged_attention_pypto.py").read_text()
     assert PRE_LAUNCH == 2
     assert TRANSFER_SLOTS == PRE_LAUNCH + 1
-    assert source.count("stack_count + PRE_LAUNCH") == 2
-    assert source.count("produce_stack = tick") == 2
-    assert source.count("consume_stack = tick - PRE_LAUNCH") == 2
-    assert source.count("produce_stack % TRANSFER_SLOTS") == 2
-    assert source.count("consume_stack % TRANSFER_SLOTS") == 2
-    assert "pl.row_expand_mul(o_iter, pending0_iter)" in source
-    assert "pending0_after = pl.tile.move(" in source
-    assert "pending1_after = pl.tile.move(" in source
+    assert STACK_TOKENS == 4 * BLOCK_SIZE
+    assert "stack_count = (seq_len + STACK_TOKENS - 1) // STACK_TOKENS" in source
+    assert "for qk_page_offset in pl.pipeline(STACK_PAGES, stage=2):" in source
+    assert 'pl.MemRef("pv_v_l1", slots=STACK_PAGES)' in source
+    assert 'pl.MemRef("pv_p_l1", slots=2)' in source
+    consume = source.index("if tick >= PRE_LAUNCH:")
+    full_stack = source.index("if consume_page + STACK_PAGES <= page_count:", consume)
+    v_pages = [source.index(f"v{page}: pl.Tile", full_stack) for page in range(STACK_PAGES)]
+    softmax_wait = source.index("SOFTMAX_READY_EVENT", v_pages[-1])
+    p_pages = [source.index(f"probability{page}: pl.Tile", softmax_wait) for page in range(STACK_PAGES)]
+    assert v_pages == sorted(v_pages)
+    assert v_pages[-1] < softmax_wait < p_pages[0]
+    assert p_pages == sorted(p_pages)
+    assert 'pl.MemRef("pv_v_prefetch' not in source
+    assert "tail_pages = page_count - consume_page" in source
+    assert source.count("if tail_pages == ") == 3
+    assert "qk_ph1 = qk_ph0" not in source
+    assert "pv_ph1 = pv_ph0" not in source
+
+    for page_count in range(1, 17):
+        stack_count = (page_count + 3) // 4
+        produced: list[int] = []
+        consumed: list[int] = []
+        for tick in range(stack_count + PRE_LAUNCH):
+            if tick < stack_count:
+                produced.append(tick)
+            if tick >= PRE_LAUNCH:
+                consumed.append(tick - PRE_LAUNCH)
+                if tick < stack_count:
+                    assert tick % TRANSFER_SLOTS != (tick - PRE_LAUNCH) % TRANSFER_SLOTS
+        assert produced == list(range(stack_count))
+        assert consumed == list(range(stack_count))
 
 
 def test_cli_accepts_scheduler_selected_devices() -> None:
     assert _parse_args(["-p", "a2a3", "-d", "13", "--matrix", "pr"]).device == 13
     assert _parse_args(["-p", "a2a3", "-d", "0", "--matrix", "pr"]).device == 0
-    with pytest.raises(SystemExit, match="2"):
+    try:
         _parse_args(["-d", "-1"])
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError("negative device ids must be rejected")
 
 
 if __name__ == "__main__":

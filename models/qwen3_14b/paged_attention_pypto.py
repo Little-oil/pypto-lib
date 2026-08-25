@@ -289,72 +289,85 @@ def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention AP
                 target_memory=pl.MemorySpace.Mat,
             )
 
-            # Keep the serving cache contract at 128 tokens per physical page,
-            # but combine four pages into one 512-token softmax/update stack.  A
-            # short final stack repeats its first physical page; AIV masks those
-            # dummy columns before softmax, so neither block-table nor cache
-            # shapes need padding or a new runtime ABI.  Cube still works on one
-            # 128-token page at a time to respect the 64-KiB L0A/L0B limits.
+            # Keep 128-token cache pages inside each 512-token softmax/update stack.
             for tick in pl.range(stack_count + PRE_LAUNCH):
                 if tick < stack_count:
                     produce_stack = tick
                     produce_page = produce_stack * STACK_PAGES
                     produce_row = transfer_base + (produce_stack % TRANSFER_SLOTS) * ROW_TILE
-                    qk_ph0 = pl.cast(
-                        pl.tensor.read(block_table_2d, [batch, produce_page]),
-                        pl.INDEX,
-                    )
-                    qk_ph1 = qk_ph0
-                    if produce_page + 1 < page_count:
-                        qk_ph1 = pl.cast(
-                            pl.tensor.read(block_table_2d, [batch, produce_page + 1]),
+                    if produce_page + STACK_PAGES <= page_count:
+                        for qk_page_offset in pl.pipeline(STACK_PAGES, stage=2):
+                            qk_ph = pl.cast(
+                                pl.tensor.read(block_table_2d, [batch, produce_page + qk_page_offset]),
+                                pl.INDEX,
+                            )
+                            qk_k_page = pl.load(
+                                key_cache_bsnd,
+                                [cache_base + qk_ph * BLOCK_SIZE, col],
+                                [BLOCK_SIZE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            qk_score_page = pl.matmul(
+                                q_tile,
+                                pl.tile.transpose_view(qk_k_page),
+                                out_dtype=pl.FP32,
+                            )
+                            pl.store(
+                                qk_score_page,
+                                [produce_row, qk_page_offset * BLOCK_SIZE],
+                                score_transfer,
+                            )
+                    else:
+                        qk_tail_ph0 = pl.cast(
+                            pl.tensor.read(block_table_2d, [batch, produce_page]),
                             pl.INDEX,
                         )
-                    qk_ph2 = qk_ph0
-                    if produce_page + 2 < page_count:
-                        qk_ph2 = pl.cast(
-                            pl.tensor.read(block_table_2d, [batch, produce_page + 2]),
-                            pl.INDEX,
+                        k_tail0 = pl.load(
+                            key_cache_bsnd,
+                            [cache_base + qk_tail_ph0 * BLOCK_SIZE, col],
+                            [BLOCK_SIZE, HEAD_DIM],
+                            target_memory=pl.MemorySpace.Mat,
                         )
-                    qk_ph3 = qk_ph0
-                    if produce_page + 3 < page_count:
-                        qk_ph3 = pl.cast(
-                            pl.tensor.read(block_table_2d, [batch, produce_page + 3]),
-                            pl.INDEX,
+                        qk_tail0 = pl.matmul(
+                            q_tile,
+                            pl.tile.transpose_view(k_tail0),
+                            out_dtype=pl.FP32,
                         )
-
-                    k0 = pl.load(
-                        key_cache_bsnd,
-                        [cache_base + qk_ph0 * BLOCK_SIZE, col],
-                        [BLOCK_SIZE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    qk0 = pl.matmul(q_tile, pl.tile.transpose_view(k0), out_dtype=pl.FP32)
-                    pl.store(qk0, [produce_row, 0], score_transfer)
-                    k1 = pl.load(
-                        key_cache_bsnd,
-                        [cache_base + qk_ph1 * BLOCK_SIZE, col],
-                        [BLOCK_SIZE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    qk1 = pl.matmul(q_tile, pl.tile.transpose_view(k1), out_dtype=pl.FP32)
-                    pl.store(qk1, [produce_row, BLOCK_SIZE], score_transfer)
-                    k2 = pl.load(
-                        key_cache_bsnd,
-                        [cache_base + qk_ph2 * BLOCK_SIZE, col],
-                        [BLOCK_SIZE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    qk2 = pl.matmul(q_tile, pl.tile.transpose_view(k2), out_dtype=pl.FP32)
-                    pl.store(qk2, [produce_row, 2 * BLOCK_SIZE], score_transfer)
-                    k3 = pl.load(
-                        key_cache_bsnd,
-                        [cache_base + qk_ph3 * BLOCK_SIZE, col],
-                        [BLOCK_SIZE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    qk3 = pl.matmul(q_tile, pl.tile.transpose_view(k3), out_dtype=pl.FP32)
-                    pl.store(qk3, [produce_row, 3 * BLOCK_SIZE], score_transfer)
+                        pl.store(qk_tail0, [produce_row, 0], score_transfer)
+                        if produce_page + 1 < page_count:
+                            qk_tail_ph1 = pl.cast(
+                                pl.tensor.read(block_table_2d, [batch, produce_page + 1]),
+                                pl.INDEX,
+                            )
+                            k_tail1 = pl.load(
+                                key_cache_bsnd,
+                                [cache_base + qk_tail_ph1 * BLOCK_SIZE, col],
+                                [BLOCK_SIZE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            qk_tail1 = pl.matmul(
+                                q_tile,
+                                pl.tile.transpose_view(k_tail1),
+                                out_dtype=pl.FP32,
+                            )
+                            pl.store(qk_tail1, [produce_row, BLOCK_SIZE], score_transfer)
+                        if produce_page + 2 < page_count:
+                            qk_tail_ph2 = pl.cast(
+                                pl.tensor.read(block_table_2d, [batch, produce_page + 2]),
+                                pl.INDEX,
+                            )
+                            k_tail2 = pl.load(
+                                key_cache_bsnd,
+                                [cache_base + qk_tail_ph2 * BLOCK_SIZE, col],
+                                [BLOCK_SIZE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            qk_tail2 = pl.matmul(
+                                q_tile,
+                                pl.tile.transpose_view(k_tail2),
+                                out_dtype=pl.FP32,
+                            )
+                            pl.store(qk_tail2, [produce_row, 2 * BLOCK_SIZE], score_transfer)
                     pl.system.sync_set(
                         QK_READY_EVENT,
                         pipe=pl.PipeType.FIX,
@@ -366,107 +379,357 @@ def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention AP
                     consume_stack = tick - PRE_LAUNCH
                     consume_page = consume_stack * STACK_PAGES
                     consume_row = transfer_base + (consume_stack % TRANSFER_SLOTS) * ROW_TILE
-                    pv_ph0 = pl.cast(
-                        pl.tensor.read(block_table_2d, [batch, consume_page]),
-                        pl.INDEX,
-                    )
-                    pv_ph1 = pv_ph0
-                    if consume_page + 1 < page_count:
+                    # Prefetch the complete valid V stack, then ping-pong P into one Acc tile.
+                    if consume_page + STACK_PAGES <= page_count:
+                        pv_ph0 = pl.cast(
+                            pl.tensor.read(block_table_2d, [batch, consume_page]),
+                            pl.INDEX,
+                        )
                         pv_ph1 = pl.cast(
                             pl.tensor.read(block_table_2d, [batch, consume_page + 1]),
                             pl.INDEX,
                         )
-                    pv_ph2 = pv_ph0
-                    if consume_page + 2 < page_count:
                         pv_ph2 = pl.cast(
                             pl.tensor.read(block_table_2d, [batch, consume_page + 2]),
                             pl.INDEX,
                         )
-                    pv_ph3 = pv_ph0
-                    if consume_page + 3 < page_count:
                         pv_ph3 = pl.cast(
                             pl.tensor.read(block_table_2d, [batch, consume_page + 3]),
                             pl.INDEX,
                         )
-
-                    pl.system.sync_wait(
-                        SOFTMAX_READY_EVENT,
-                        pipe=pl.PipeType.MTE2,
-                        core_type="aic",
-                    )
-                    probability0 = pl.load(
-                        probability_transfer,
-                        [consume_row, 0],
-                        [ROW_TILE, BLOCK_SIZE],
-                        valid_shape=[GROUP, BLOCK_SIZE],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    v0 = pl.load(
-                        value_cache_bsnd,
-                        [cache_base + pv_ph0 * BLOCK_SIZE, col],
-                        [BLOCK_SIZE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    pv0 = pl.matmul(
-                        pl.tile.move(probability0, target_memory=pl.MemorySpace.Left),
-                        pl.tile.move(v0, target_memory=pl.MemorySpace.Right),
-                        out_dtype=pl.FP32,
-                    )
-                    probability1 = pl.load(
-                        probability_transfer,
-                        [consume_row, BLOCK_SIZE],
-                        [ROW_TILE, BLOCK_SIZE],
-                        valid_shape=[GROUP, BLOCK_SIZE],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    v1 = pl.load(
-                        value_cache_bsnd,
-                        [cache_base + pv_ph1 * BLOCK_SIZE, col],
-                        [BLOCK_SIZE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    pv1 = pl.matmul_acc(
-                        pv0,
-                        pl.tile.move(probability1, target_memory=pl.MemorySpace.Left),
-                        pl.tile.move(v1, target_memory=pl.MemorySpace.Right),
-                    )
-                    probability2 = pl.load(
-                        probability_transfer,
-                        [consume_row, 2 * BLOCK_SIZE],
-                        [ROW_TILE, BLOCK_SIZE],
-                        valid_shape=[GROUP, BLOCK_SIZE],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    v2 = pl.load(
-                        value_cache_bsnd,
-                        [cache_base + pv_ph2 * BLOCK_SIZE, col],
-                        [BLOCK_SIZE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    pv2 = pl.matmul_acc(
-                        pv1,
-                        pl.tile.move(probability2, target_memory=pl.MemorySpace.Left),
-                        pl.tile.move(v2, target_memory=pl.MemorySpace.Right),
-                    )
-                    probability3 = pl.load(
-                        probability_transfer,
-                        [consume_row, 3 * BLOCK_SIZE],
-                        [ROW_TILE, BLOCK_SIZE],
-                        valid_shape=[GROUP, BLOCK_SIZE],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    v3 = pl.load(
-                        value_cache_bsnd,
-                        [cache_base + pv_ph3 * BLOCK_SIZE, col],
-                        [BLOCK_SIZE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Mat,
-                    )
-                    pv3 = pl.matmul_acc(
-                        pv2,
-                        pl.tile.move(probability3, target_memory=pl.MemorySpace.Left),
-                        pl.tile.move(v3, target_memory=pl.MemorySpace.Right),
-                    )
-                    pl.store(pv3, [consume_row, 0], pv_transfer)
+                        v0: pl.Tile[
+                            [BLOCK_SIZE, HEAD_DIM],
+                            pl.BF16,
+                            pl.MemRef("pv_v_l1", slots=STACK_PAGES)[0],
+                            pl.Mem.Mat,
+                        ] = pl.load(
+                            value_cache_bsnd,
+                            [cache_base + pv_ph0 * BLOCK_SIZE, col],
+                            [BLOCK_SIZE, HEAD_DIM],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        v1: pl.Tile[
+                            [BLOCK_SIZE, HEAD_DIM],
+                            pl.BF16,
+                            pl.MemRef("pv_v_l1", slots=STACK_PAGES)[1],
+                            pl.Mem.Mat,
+                        ] = pl.load(
+                            value_cache_bsnd,
+                            [cache_base + pv_ph1 * BLOCK_SIZE, col],
+                            [BLOCK_SIZE, HEAD_DIM],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        v2: pl.Tile[
+                            [BLOCK_SIZE, HEAD_DIM],
+                            pl.BF16,
+                            pl.MemRef("pv_v_l1", slots=STACK_PAGES)[2],
+                            pl.Mem.Mat,
+                        ] = pl.load(
+                            value_cache_bsnd,
+                            [cache_base + pv_ph2 * BLOCK_SIZE, col],
+                            [BLOCK_SIZE, HEAD_DIM],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        v3: pl.Tile[
+                            [BLOCK_SIZE, HEAD_DIM],
+                            pl.BF16,
+                            pl.MemRef("pv_v_l1", slots=STACK_PAGES)[3],
+                            pl.Mem.Mat,
+                        ] = pl.load(
+                            value_cache_bsnd,
+                            [cache_base + pv_ph3 * BLOCK_SIZE, col],
+                            [BLOCK_SIZE, HEAD_DIM],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        pl.system.sync_wait(
+                            SOFTMAX_READY_EVENT,
+                            pipe=pl.PipeType.MTE2,
+                            core_type="aic",
+                        )
+                        probability0: pl.Tile[
+                            [ROW_TILE, BLOCK_SIZE],
+                            pl.BF16,
+                            pl.MemRef("pv_p_l1", slots=2)[0],
+                            pl.Mem.Mat,
+                        ] = pl.load(
+                            probability_transfer,
+                            [consume_row, 0],
+                            [ROW_TILE, BLOCK_SIZE],
+                            valid_shape=[GROUP, BLOCK_SIZE],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        pv0 = pl.matmul(
+                            pl.tile.move(probability0, target_memory=pl.MemorySpace.Left),
+                            pl.tile.move(v0, target_memory=pl.MemorySpace.Right),
+                            out_dtype=pl.FP32,
+                        )
+                        probability1: pl.Tile[
+                            [ROW_TILE, BLOCK_SIZE],
+                            pl.BF16,
+                            pl.MemRef("pv_p_l1", slots=2)[1],
+                            pl.Mem.Mat,
+                        ] = pl.load(
+                            probability_transfer,
+                            [consume_row, BLOCK_SIZE],
+                            [ROW_TILE, BLOCK_SIZE],
+                            valid_shape=[GROUP, BLOCK_SIZE],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        pv1 = pl.matmul_acc(
+                            pv0,
+                            pl.tile.move(probability1, target_memory=pl.MemorySpace.Left),
+                            pl.tile.move(v1, target_memory=pl.MemorySpace.Right),
+                        )
+                        probability2: pl.Tile[
+                            [ROW_TILE, BLOCK_SIZE],
+                            pl.BF16,
+                            pl.MemRef("pv_p_l1", slots=2)[0],
+                            pl.Mem.Mat,
+                        ] = pl.load(
+                            probability_transfer,
+                            [consume_row, 2 * BLOCK_SIZE],
+                            [ROW_TILE, BLOCK_SIZE],
+                            valid_shape=[GROUP, BLOCK_SIZE],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        pv2 = pl.matmul_acc(
+                            pv1,
+                            pl.tile.move(probability2, target_memory=pl.MemorySpace.Left),
+                            pl.tile.move(v2, target_memory=pl.MemorySpace.Right),
+                        )
+                        probability3: pl.Tile[
+                            [ROW_TILE, BLOCK_SIZE],
+                            pl.BF16,
+                            pl.MemRef("pv_p_l1", slots=2)[1],
+                            pl.Mem.Mat,
+                        ] = pl.load(
+                            probability_transfer,
+                            [consume_row, 3 * BLOCK_SIZE],
+                            [ROW_TILE, BLOCK_SIZE],
+                            valid_shape=[GROUP, BLOCK_SIZE],
+                            target_memory=pl.MemorySpace.Mat,
+                        )
+                        pv3 = pl.matmul_acc(
+                            pv2,
+                            pl.tile.move(probability3, target_memory=pl.MemorySpace.Left),
+                            pl.tile.move(v3, target_memory=pl.MemorySpace.Right),
+                        )
+                        pl.store(pv3, [consume_row, 0], pv_transfer)
+                    else:
+                        tail_pages = page_count - consume_page
+                        if tail_pages == 1:
+                            pv1_ph0 = pl.cast(
+                                pl.tensor.read(block_table_2d, [batch, consume_page]),
+                                pl.INDEX,
+                            )
+                            v1_0: pl.Tile[
+                                [BLOCK_SIZE, HEAD_DIM],
+                                pl.BF16,
+                                pl.MemRef("pv_v_l1", slots=STACK_PAGES)[0],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                value_cache_bsnd,
+                                [cache_base + pv1_ph0 * BLOCK_SIZE, col],
+                                [BLOCK_SIZE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pl.system.sync_wait(
+                                SOFTMAX_READY_EVENT,
+                                pipe=pl.PipeType.MTE2,
+                                core_type="aic",
+                            )
+                            probability1_0: pl.Tile[
+                                [ROW_TILE, BLOCK_SIZE],
+                                pl.BF16,
+                                pl.MemRef("pv_p_l1", slots=2)[0],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                probability_transfer,
+                                [consume_row, 0],
+                                [ROW_TILE, BLOCK_SIZE],
+                                valid_shape=[GROUP, BLOCK_SIZE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_tail1 = pl.matmul(
+                                pl.tile.move(probability1_0, target_memory=pl.MemorySpace.Left),
+                                pl.tile.move(v1_0, target_memory=pl.MemorySpace.Right),
+                                out_dtype=pl.FP32,
+                            )
+                            pl.store(pv_tail1, [consume_row, 0], pv_transfer)
+                        if tail_pages == 2:
+                            pv2_ph0 = pl.cast(
+                                pl.tensor.read(block_table_2d, [batch, consume_page]),
+                                pl.INDEX,
+                            )
+                            pv2_ph1 = pl.cast(
+                                pl.tensor.read(block_table_2d, [batch, consume_page + 1]),
+                                pl.INDEX,
+                            )
+                            v2_0: pl.Tile[
+                                [BLOCK_SIZE, HEAD_DIM],
+                                pl.BF16,
+                                pl.MemRef("pv_v_l1", slots=STACK_PAGES)[0],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                value_cache_bsnd,
+                                [cache_base + pv2_ph0 * BLOCK_SIZE, col],
+                                [BLOCK_SIZE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            v2_1: pl.Tile[
+                                [BLOCK_SIZE, HEAD_DIM],
+                                pl.BF16,
+                                pl.MemRef("pv_v_l1", slots=STACK_PAGES)[1],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                value_cache_bsnd,
+                                [cache_base + pv2_ph1 * BLOCK_SIZE, col],
+                                [BLOCK_SIZE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pl.system.sync_wait(
+                                SOFTMAX_READY_EVENT,
+                                pipe=pl.PipeType.MTE2,
+                                core_type="aic",
+                            )
+                            probability2_0: pl.Tile[
+                                [ROW_TILE, BLOCK_SIZE],
+                                pl.BF16,
+                                pl.MemRef("pv_p_l1", slots=2)[0],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                probability_transfer,
+                                [consume_row, 0],
+                                [ROW_TILE, BLOCK_SIZE],
+                                valid_shape=[GROUP, BLOCK_SIZE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_tail2_0 = pl.matmul(
+                                pl.tile.move(probability2_0, target_memory=pl.MemorySpace.Left),
+                                pl.tile.move(v2_0, target_memory=pl.MemorySpace.Right),
+                                out_dtype=pl.FP32,
+                            )
+                            probability2_1: pl.Tile[
+                                [ROW_TILE, BLOCK_SIZE],
+                                pl.BF16,
+                                pl.MemRef("pv_p_l1", slots=2)[1],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                probability_transfer,
+                                [consume_row, BLOCK_SIZE],
+                                [ROW_TILE, BLOCK_SIZE],
+                                valid_shape=[GROUP, BLOCK_SIZE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_tail2_1 = pl.matmul_acc(
+                                pv_tail2_0,
+                                pl.tile.move(probability2_1, target_memory=pl.MemorySpace.Left),
+                                pl.tile.move(v2_1, target_memory=pl.MemorySpace.Right),
+                            )
+                            pl.store(pv_tail2_1, [consume_row, 0], pv_transfer)
+                        if tail_pages == 3:
+                            pv3_ph0 = pl.cast(
+                                pl.tensor.read(block_table_2d, [batch, consume_page]),
+                                pl.INDEX,
+                            )
+                            pv3_ph1 = pl.cast(
+                                pl.tensor.read(block_table_2d, [batch, consume_page + 1]),
+                                pl.INDEX,
+                            )
+                            pv3_ph2 = pl.cast(
+                                pl.tensor.read(block_table_2d, [batch, consume_page + 2]),
+                                pl.INDEX,
+                            )
+                            v3_0: pl.Tile[
+                                [BLOCK_SIZE, HEAD_DIM],
+                                pl.BF16,
+                                pl.MemRef("pv_v_l1", slots=STACK_PAGES)[0],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                value_cache_bsnd,
+                                [cache_base + pv3_ph0 * BLOCK_SIZE, col],
+                                [BLOCK_SIZE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            v3_1: pl.Tile[
+                                [BLOCK_SIZE, HEAD_DIM],
+                                pl.BF16,
+                                pl.MemRef("pv_v_l1", slots=STACK_PAGES)[1],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                value_cache_bsnd,
+                                [cache_base + pv3_ph1 * BLOCK_SIZE, col],
+                                [BLOCK_SIZE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            v3_2: pl.Tile[
+                                [BLOCK_SIZE, HEAD_DIM],
+                                pl.BF16,
+                                pl.MemRef("pv_v_l1", slots=STACK_PAGES)[2],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                value_cache_bsnd,
+                                [cache_base + pv3_ph2 * BLOCK_SIZE, col],
+                                [BLOCK_SIZE, HEAD_DIM],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pl.system.sync_wait(
+                                SOFTMAX_READY_EVENT,
+                                pipe=pl.PipeType.MTE2,
+                                core_type="aic",
+                            )
+                            probability3_0: pl.Tile[
+                                [ROW_TILE, BLOCK_SIZE],
+                                pl.BF16,
+                                pl.MemRef("pv_p_l1", slots=2)[0],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                probability_transfer,
+                                [consume_row, 0],
+                                [ROW_TILE, BLOCK_SIZE],
+                                valid_shape=[GROUP, BLOCK_SIZE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_tail3_0 = pl.matmul(
+                                pl.tile.move(probability3_0, target_memory=pl.MemorySpace.Left),
+                                pl.tile.move(v3_0, target_memory=pl.MemorySpace.Right),
+                                out_dtype=pl.FP32,
+                            )
+                            probability3_1: pl.Tile[
+                                [ROW_TILE, BLOCK_SIZE],
+                                pl.BF16,
+                                pl.MemRef("pv_p_l1", slots=2)[1],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                probability_transfer,
+                                [consume_row, BLOCK_SIZE],
+                                [ROW_TILE, BLOCK_SIZE],
+                                valid_shape=[GROUP, BLOCK_SIZE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_tail3_1 = pl.matmul_acc(
+                                pv_tail3_0,
+                                pl.tile.move(probability3_1, target_memory=pl.MemorySpace.Left),
+                                pl.tile.move(v3_1, target_memory=pl.MemorySpace.Right),
+                            )
+                            probability3_2: pl.Tile[
+                                [ROW_TILE, BLOCK_SIZE],
+                                pl.BF16,
+                                pl.MemRef("pv_p_l1", slots=2)[0],
+                                pl.Mem.Mat,
+                            ] = pl.load(
+                                probability_transfer,
+                                [consume_row, 2 * BLOCK_SIZE],
+                                [ROW_TILE, BLOCK_SIZE],
+                                valid_shape=[GROUP, BLOCK_SIZE],
+                                target_memory=pl.MemorySpace.Mat,
+                            )
+                            pv_tail3_2 = pl.matmul_acc(
+                                pv_tail3_1,
+                                pl.tile.move(probability3_2, target_memory=pl.MemorySpace.Left),
+                                pl.tile.move(v3_2, target_memory=pl.MemorySpace.Right),
+                            )
+                            pl.store(pv_tail3_2, [consume_row, 0], pv_transfer)
                     pl.system.sync_set(
                         PV_READY_EVENT,
                         pipe=pl.PipeType.FIX,

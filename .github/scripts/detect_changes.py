@@ -44,28 +44,6 @@ from collections import defaultdict
 # Directories whose .py files participate in the bare-name sibling-import graph.
 SOURCE_ROOTS = ("examples", "models")
 
-# Qwen paged-attention drivers have dedicated campaign CLIs and must be run
-# only by the dedicated Qwen paged-attention jobs.  The generic harness passes
-# just ``-p``/``-d`` and would both argparse-fail these files and accidentally
-# enroll an A2/A3-only kernel in the a5sim sweep.
-EXPLICIT_CI_RUNNABLES = frozenset(
-    {
-        "models/qwen3_14b/decode_fwd.py",
-        "models/qwen3_14b/test_paged_attention_pypto.py",
-    }
-)
-
-QWEN_PA_EXACT_PATHS = frozenset(
-    {
-        ".github/actions/pypto-serving-tests/action.yml",
-        ".github/scripts/detect_changes.py",
-        ".github/workflows/ci.yml",
-        ".github/workflows/daily_ci.yml",
-        "tests/contract/test_qwen3_14b_contract.py",
-    }
-)
-QWEN_PA_PREFIXES = ("models/qwen3_14b/",)
-
 # Paths that can change documentation or repository guidance but cannot change
 # generated kernels or runtime behavior. Keep this list explicit: an unknown
 # path must continue to select the full examples suite.
@@ -127,7 +105,10 @@ def build_reverse_graph():
     """
     files = list(_iter_source_files())
     # (dir, basename-without-.py) -> file path, for resolving sibling imports.
-    module_of = {(os.path.dirname(f), os.path.splitext(os.path.basename(f))[0]): f for f in files}
+    module_of = {
+        (os.path.dirname(f), os.path.splitext(os.path.basename(f))[0]): f
+        for f in files
+    }
     reverse = defaultdict(set)
     for f in files:
         d = os.path.dirname(f)
@@ -162,11 +143,6 @@ def has_runtime_impact(changed):
     return any(path and not _is_non_runtime_path(path) for path in changed)
 
 
-def has_qwen_pa_impact(changed):
-    """Whether dedicated Qwen paged-attention automation must run."""
-    return any(path in QWEN_PA_EXACT_PATHS or path.startswith(QWEN_PA_PREFIXES) for path in changed if path)
-
-
 def select_runnable(changed):
     """Return runnable scripts required for the supplied changed paths."""
     changed = [path for path in changed if path]
@@ -174,7 +150,8 @@ def select_runnable(changed):
     # Documentation-only paths select no device work. Any unknown or explicitly
     # runtime-affecting non-model path still selects the full examples suite.
     non_models_touched = any(
-        not path.startswith("models/") and not _is_non_runtime_path(path) for path in changed
+        not path.startswith("models/") and not _is_non_runtime_path(path)
+        for path in changed
     )
     # Only models/ uses the reverse-import graph: a changed examples/ file is
     # already covered by the full-suite run above, so it needs no closure here.
@@ -198,23 +175,17 @@ def select_runnable(changed):
     selected = closure(models_changed, reverse)
 
     if non_models_touched:
-        selected.update(f for f in _iter_source_files() if f.startswith("examples/"))
+        selected.update(
+            f for f in _iter_source_files() if f.startswith("examples/")
+        )
 
-    return sorted(
-        f for f in selected if os.path.isfile(f) and _has_main(f) and f not in EXPLICIT_CI_RUNNABLES
-    )
+    return sorted(f for f in selected if os.path.isfile(f) and _has_main(f))
 
 
 def main():
     changed = [line.strip() for line in sys.stdin if line.strip()]
-    if "--list-explicit-runnables" in sys.argv[1:]:
-        print(" ".join(sorted(EXPLICIT_CI_RUNNABLES)))
-        return
     if "--runtime-impact" in sys.argv[1:]:
         print("true" if has_runtime_impact(changed) else "false")
-        return
-    if "--qwen-pa-impact" in sys.argv[1:]:
-        print("true" if has_qwen_pa_impact(changed) else "false")
         return
     print(" ".join(select_runnable(changed)))
 

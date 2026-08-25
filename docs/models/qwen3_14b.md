@@ -132,9 +132,9 @@ schedules is defined by the
 ## Validation
 
 The Page Attention component driver provides focused deterministic Torch-oracle
-cases, PR/nightly pairwise matrices, full wrapper-codegen checks, and optional
-raw benchmark recording. Performance reports are informational and never gate
-the production implementation.
+cases, focused and full pairwise matrix presets, wrapper-codegen checks, and
+optional raw benchmark recording. Performance reports are informational and
+never gate the production implementation.
 
 Run the component PR matrix and a B17 production-decode golden (one full window
 plus a one-row tail window) on an A2/A3 device with:
@@ -149,5 +149,7 @@ python models/qwen3_14b/decode_fwd.py \
   --seq-lens 1,2,127,128,129,255,256,257,511,512,513,1023,2048,3584,4095,4096,129
 ```
 
-Dedicated CI also compiles the production path on A2/A3 sim and runs component,
-integrated decode, and real-weight `pypto-serving` accuracy coverage on A2/A3.
+Repository CI routes PA changes through the generic A2/A3 component smoke and
+single-layer decode golden, then runs real-weight `pypto-serving` accuracy
+coverage on A2/A3. The larger matrix commands above remain available for
+focused validation.
