@@ -99,8 +99,9 @@ QH_MM_TILE = 64
 QH_WORKERS = 24
 QH_HEAD_DIM_TILE = 64
 ROPE_ROW_BLOCK = IDX_N_HEADS
-# qr_rope SPMD tile == row block: one ROPE_ROW_TILE-row block per SPMD tile.
+# qr_rope runs on persistent workers, each striding over ROPE_ROW_TILE-row blocks.
 ROPE_ROW_TILE = 32
+ROPE_WORKERS = 48
 assert IDX_N_HEADS >= ROPE_ROW_TILE and IDX_N_HEADS % ROPE_ROW_TILE == 0
 TOPK_PAIR_WIDTH = 2 * IDX_TOPK
 
@@ -708,19 +709,21 @@ def indexer(
         rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = pl.cast(
             pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)                   # j^1
 
-    for idx in pl.spmd(bs_heads // ROPE_ROW_TILE, name_hint="qr_rope", allow_early_resolve=True):
-        o0 = idx * ROPE_ROW_TILE
-        token_idx = o0 // ROPE_ROW_BLOCK
+    for rope_worker in pl.spmd(ROPE_WORKERS, name_hint="qr_rope", allow_early_resolve=True):
+        # The swap index is the same for every block, so it is read once per worker.
         rope_swap_idx = rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM]
-        cos_row = cos[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM]
-        sin_row = sin[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM]
-        qr_nope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
-        qr_rope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-        qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(
-            pl.col_expand_mul(qr_rope_slice, cos_row), pl.col_expand_mul(qr_swapped, sin_row))
-        qr_vec = pl.concat(pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint"), pl.cast(rope_rot, target_type=pl.BF16, mode="rint"))
-        qr_bf16[o0 : o0 + ROPE_ROW_TILE, :] = qr_vec
+        for idx in pl.range(rope_worker, bs_heads // ROPE_ROW_TILE, ROPE_WORKERS):
+            o0 = idx * ROPE_ROW_TILE
+            token_idx = o0 // ROPE_ROW_BLOCK
+            cos_row = cos[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM]
+            sin_row = sin[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM]
+            qr_nope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
+            qr_rope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
+            qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
+            rope_rot = pl.add(
+                pl.col_expand_mul(qr_rope_slice, cos_row), pl.col_expand_mul(qr_swapped, sin_row))
+            qr_vec = pl.concat(pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint"), pl.cast(rope_rot, target_type=pl.BF16, mode="rint"))
+            qr_bf16[o0 : o0 + ROPE_ROW_TILE, :] = qr_vec
 
     # cube-only scope: q @ hadamard lands in GM, keeping the vector amax/quant below
     # in its own scope so the two run as separate cube and vector tasks.
