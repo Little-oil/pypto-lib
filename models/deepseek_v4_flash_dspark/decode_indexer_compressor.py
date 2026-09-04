@@ -68,6 +68,8 @@ KV_SCORE_WORKERS = 24
 # scatter_softmax_pool and compress_state_commit run on persistent workers,
 # each striding over requests.
 POOL_WORKERS = 48
+# kv_hadamard runs on persistent workers; the hadamard tile is read once per worker.
+HADAMARD_WORKERS = 24
 COMMIT_WORKERS = 48
 # Scratch spans the CP group's whole token stream, not the rank-local B * S.
 GROUP_BS = DECODE_BATCH * DECODE_SEQ
@@ -301,14 +303,17 @@ def indexer_compressor(
         )
 
     kv_final = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
-    with pl.spmd(rms_blocks, name_hint="kv_hadamard", deps=[rms_tid]) as hadamard_tid:
-        had_blk = pl.tile.get_block_idx()
-        had_b0 = had_blk * RMS_PAD_TILE
-        kv_proj_tile = normed_kv[had_b0 : had_b0 + RMS_PAD_TILE, 0 : HEAD_DIM]
+    with pl.spmd(HADAMARD_WORKERS, name_hint="kv_hadamard", deps=[rms_tid]) as hadamard_tid:
+        had_worker = pl.tile.get_block_idx()
+        # Column tile outermost: the hadamard slice is then read once per worker per
+        # column instead of once per row block, and the row blocks reuse it.
         for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
             hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
-            kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-            kv_final[had_b0 : had_b0 + RMS_PAD_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
+            for had_blk in pl.range(had_worker, rms_blocks, HADAMARD_WORKERS):
+                had_b0 = had_blk * RMS_PAD_TILE
+                kv_proj_tile = normed_kv[had_b0 : had_b0 + RMS_PAD_TILE, 0 : HEAD_DIM]
+                kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
+                kv_final[had_b0 : had_b0 + RMS_PAD_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
 
     with pl.spmd(rms_blocks, name_hint="kv_and_cache_write", deps=[hadamard_tid]) as _write_tid:
         wr_blk = pl.tile.get_block_idx()
