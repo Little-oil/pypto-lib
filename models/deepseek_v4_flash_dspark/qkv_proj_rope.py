@@ -68,6 +68,9 @@ QPROJ_M_TILE = 64  # dense qproj token tile; fills the 128 KiB L0C accumulator
 QPROJ_TAIL_M_TILE = MATMUL_T_TILE  # partial-M path validated by decode/small physical T
 KV_RMS_T_TILE = 16  # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
+# q_rope_prepare runs on persistent workers, capped at the tile count so the
+# short call sites do not dispatch more blocks than they have work.
+Q_ROPE_WORKERS = 48
 Q_ROPE_H_TILE = 4  # heads per fused qproj dequant/rms/rope task
 assert QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert QPROJ_M_TILE % QPROJ_TAIL_M_TILE == 0
@@ -137,9 +140,11 @@ def rope_prepare(
     rope_swap_idx_view = pl.reshape(rope_swap_idx, [t_dim, ROPE_DIM])
 
     token_tiles = (t_dim + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE
-    for qrp_idx in pl.spmd(token_tiles, name_hint="q_rope_prepare", allow_early_resolve=True):
-        qrp_t0 = qrp_idx * Q_ROPE_T_TILE
-        qrp_valid_rows = pl.min(Q_ROPE_T_TILE, t_dim - qrp_t0)
+    for qrp_worker in pl.spmd(
+        pl.min(Q_ROPE_WORKERS, token_tiles), name_hint="q_rope_prepare", allow_early_resolve=True
+    ):
+        # The interleave lane, swap index and sign fold only depend on the column
+        # index, so they are built once per worker instead of once per tile.
         qrp_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         qrp_idx_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
         qrp_idx_fp32 = pl.cast(qrp_idx_i32, target_type=pl.FP32)
@@ -154,90 +159,93 @@ def rope_prepare(
         qrp_swap_f = pl.sub(qrp_next_col, qrp_lane_offset)
         qrp_swap_idx = pl.cast(qrp_swap_f, target_type=pl.INT32)
         qrp_sign = pl.sub(pl.mul(qrp_lane, 2.0), 1.0)
-        if qrp_valid_rows == Q_ROPE_T_TILE:
-            qrp_cos_rows_full = rope_cos_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
-            qrp_sin_rows_full = rope_sin_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
-            qrp_cos_full = pl.cast(qrp_cos_rows_full, target_type=pl.FP32)
-            qrp_sin_full = pl.cast(qrp_sin_rows_full, target_type=pl.FP32)
-            qrp_cos_il_full = pl.gather(qrp_cos_full, dim=-1, index=qrp_dup_idx)
-            qrp_sin_il_full = pl.gather(qrp_sin_full, dim=-1, index=qrp_dup_idx)
-            qrp_sin_signed_full = pl.mul(qrp_sin_il_full, qrp_sign)
-            rope_cos_il_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_cos_il_full
-            rope_sin_signed_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_sin_signed_full
-            rope_swap_idx_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_swap_idx
-        else:
-            qrp_cos_rows_tail = pl.load(
-                rope_cos_view,
-                [qrp_t0, 0],
-                [Q_ROPE_T_TILE, ROPE_DIM],
-                valid_shape=[qrp_valid_rows, ROPE_DIM],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            qrp_sin_rows_tail = pl.load(
-                rope_sin_view,
-                [qrp_t0, 0],
-                [Q_ROPE_T_TILE, ROPE_DIM],
-                valid_shape=[qrp_valid_rows, ROPE_DIM],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            qrp_tail_col = pl.col_expand_mul(
-                pl.tile.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
-                pl.cast(pl.tile.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32),
-            )
-            qrp_tail_dup_f = pl.cast(
-                pl.cast(pl.mul(qrp_tail_col, 0.5), target_type=pl.INT32, mode="trunc"),
-                target_type=pl.FP32,
-            )
-            qrp_tail_lane = pl.sub(qrp_tail_col, pl.mul(qrp_tail_dup_f, 2.0))
-            qrp_tail_swap_f = pl.sub(pl.add(qrp_tail_col, 1.0), pl.mul(qrp_tail_lane, 2.0))
-            # Row-major flattening offsets stay in fp32: col-expand is defined for
-            # half / float only.
-            qrp_row_seed = pl.mul(
-                pl.cast(pl.tile.arange(0, [1, Q_ROPE_T_TILE], dtype=pl.INT32), target_type=pl.FP32),
-                ROPE_DIM_SCALE,
-            )
-            qrp_row_grid = pl.col_expand_mul(
-                pl.tile.full([ROPE_DIM, Q_ROPE_T_TILE], dtype=pl.FP32, value=1.0),
-                qrp_row_seed,
-            )
-            qrp_row_offset = pl.transpose(qrp_row_grid, axis1=0, axis2=1)
-            qrp_dup_idx_tail = pl.cast(pl.add(qrp_tail_dup_f, qrp_row_offset), target_type=pl.INT32)
-            qrp_gather_tmp = pl.create_tile(
-                [Q_ROPE_T_TILE, ROPE_DIM],
-                dtype=pl.INT32,
-                target_memory=pl.MemorySpace.Vec,
-            )
-            qrp_cos_il_tail = pl.tile.gather(
-                pl.cast(qrp_cos_rows_tail, target_type=pl.FP32),
-                qrp_dup_idx_tail,
-                qrp_gather_tmp,
-            )
-            qrp_sin_il_tail = pl.tile.gather(
-                pl.cast(qrp_sin_rows_tail, target_type=pl.FP32),
-                qrp_dup_idx_tail,
-                qrp_gather_tmp,
-            )
-            qrp_tail_sign = pl.sub(pl.mul(qrp_tail_lane, 2.0), 1.0)
-            qrp_sin_signed_tail = pl.mul(qrp_sin_il_tail, qrp_tail_sign)
-            pl.store(
-                pl.set_validshape(qrp_cos_il_tail, qrp_valid_rows, ROPE_DIM),
-                [qrp_t0, 0],
-                rope_cos_il_view,
-            )
-            pl.store(
-                pl.set_validshape(qrp_sin_signed_tail, qrp_valid_rows, ROPE_DIM),
-                [qrp_t0, 0],
-                rope_sin_signed_view,
-            )
-            pl.store(
-                pl.set_validshape(
-                    pl.cast(qrp_tail_swap_f, target_type=pl.INT32),
-                    qrp_valid_rows,
-                    ROPE_DIM,
-                ),
-                [qrp_t0, 0],
-                rope_swap_idx_view,
-            )
+        for qrp_idx in pl.range(qrp_worker, token_tiles, pl.min(Q_ROPE_WORKERS, token_tiles)):
+            qrp_t0 = qrp_idx * Q_ROPE_T_TILE
+            qrp_valid_rows = pl.min(Q_ROPE_T_TILE, t_dim - qrp_t0)
+            if qrp_valid_rows == Q_ROPE_T_TILE:
+                qrp_cos_rows_full = rope_cos_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
+                qrp_sin_rows_full = rope_sin_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
+                qrp_cos_full = pl.cast(qrp_cos_rows_full, target_type=pl.FP32)
+                qrp_sin_full = pl.cast(qrp_sin_rows_full, target_type=pl.FP32)
+                qrp_cos_il_full = pl.gather(qrp_cos_full, dim=-1, index=qrp_dup_idx)
+                qrp_sin_il_full = pl.gather(qrp_sin_full, dim=-1, index=qrp_dup_idx)
+                qrp_sin_signed_full = pl.mul(qrp_sin_il_full, qrp_sign)
+                rope_cos_il_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_cos_il_full
+                rope_sin_signed_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_sin_signed_full
+                rope_swap_idx_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_swap_idx
+            else:
+                qrp_cos_rows_tail = pl.load(
+                    rope_cos_view,
+                    [qrp_t0, 0],
+                    [Q_ROPE_T_TILE, ROPE_DIM],
+                    valid_shape=[qrp_valid_rows, ROPE_DIM],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                qrp_sin_rows_tail = pl.load(
+                    rope_sin_view,
+                    [qrp_t0, 0],
+                    [Q_ROPE_T_TILE, ROPE_DIM],
+                    valid_shape=[qrp_valid_rows, ROPE_DIM],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                qrp_tail_col = pl.col_expand_mul(
+                    pl.tile.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
+                    pl.cast(pl.tile.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32),
+                )
+                qrp_tail_dup_f = pl.cast(
+                    pl.cast(pl.mul(qrp_tail_col, 0.5), target_type=pl.INT32, mode="trunc"),
+                    target_type=pl.FP32,
+                )
+                qrp_tail_lane = pl.sub(qrp_tail_col, pl.mul(qrp_tail_dup_f, 2.0))
+                qrp_tail_swap_f = pl.sub(pl.add(qrp_tail_col, 1.0), pl.mul(qrp_tail_lane, 2.0))
+                # Row-major flattening offsets stay in fp32: col-expand is defined for
+                # half / float only.
+                qrp_row_seed = pl.mul(
+                    pl.cast(pl.tile.arange(0, [1, Q_ROPE_T_TILE], dtype=pl.INT32), target_type=pl.FP32),
+                    ROPE_DIM_SCALE,
+                )
+                qrp_row_grid = pl.col_expand_mul(
+                    pl.tile.full([ROPE_DIM, Q_ROPE_T_TILE], dtype=pl.FP32, value=1.0),
+                    qrp_row_seed,
+                )
+                qrp_row_offset = pl.transpose(qrp_row_grid, axis1=0, axis2=1)
+                qrp_dup_idx_tail = pl.cast(pl.add(qrp_tail_dup_f, qrp_row_offset), target_type=pl.INT32)
+                qrp_gather_tmp = pl.create_tile(
+                    [Q_ROPE_T_TILE, ROPE_DIM],
+                    dtype=pl.INT32,
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                qrp_cos_il_tail = pl.tile.gather(
+                    pl.cast(qrp_cos_rows_tail, target_type=pl.FP32),
+                    qrp_dup_idx_tail,
+                    qrp_gather_tmp,
+                )
+                qrp_sin_il_tail = pl.tile.gather(
+                    pl.cast(qrp_sin_rows_tail, target_type=pl.FP32),
+                    qrp_dup_idx_tail,
+                    qrp_gather_tmp,
+                )
+                qrp_tail_sign = pl.sub(pl.mul(qrp_tail_lane, 2.0), 1.0)
+                qrp_sin_signed_tail = pl.mul(qrp_sin_il_tail, qrp_tail_sign)
+                pl.store(
+                    pl.set_validshape(qrp_cos_il_tail, qrp_valid_rows, ROPE_DIM),
+                    [qrp_t0, 0],
+                    rope_cos_il_view,
+                )
+                pl.store(
+                    pl.set_validshape(qrp_sin_signed_tail, qrp_valid_rows, ROPE_DIM),
+                    [qrp_t0, 0],
+                    rope_sin_signed_view,
+                )
+                pl.store(
+                    pl.set_validshape(
+                        pl.cast(qrp_tail_swap_f, target_type=pl.INT32),
+                        qrp_valid_rows,
+                        ROPE_DIM,
+                    ),
+                    [qrp_t0, 0],
+                    rope_swap_idx_view,
+                )
 
 
 @pl.jit.inline(auto_scope=False)
