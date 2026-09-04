@@ -65,6 +65,8 @@ OUT_TILE = 64
 MM_B_TILE = 16
 # kv_score_proj runs on persistent workers, each striding over the block list.
 KV_SCORE_WORKERS = 24
+# compress_state_commit runs on persistent workers, each striding over requests.
+COMMIT_WORKERS = 48
 # Scratch spans the CP group's whole token stream, which the compressor runs
 # over, not the rank-local B * S.
 GROUP_BS = DECODE_BATCH * DECODE_SEQ
@@ -219,19 +221,20 @@ def compressor_ratio4(
     # One block per request, like the pool above. Each token commits to its own
     # ring row: S <= STATE_LEN, so a request's tokens hold distinct positions mod
     # STATE_LEN, and requests hold distinct state pages.
-    with pl.spmd(b_dim, name_hint="compress_state_commit", deps=[pool_tid]):
-        c_idx = pl.tile.get_block_idx()
-        for s_idx in pl.range(s_dim):
-            token = c_idx * s_dim + s_idx
-            state_row_i64 = pl.read(state_slot_mapping, [token])
-            if state_row_i64 >= 0:
-                state_row = pl.cast(state_row_i64, pl.INDEX)
-                token_pos = pl.read(position_ids, [token])
-                ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
-                compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = cmp4_kv_proj_pad[
-                    token : token + 1, 0 : OUT_DIM]
-                compress_state_flat[state_row : state_row + 1, OUT_DIM : COMPRESS_STATE_DIM] = pl.add(
-                    cmp4_score_proj_pad[token : token + 1, 0 : OUT_DIM], ape[ape_row : ape_row + 1, 0 : OUT_DIM])
+    with pl.spmd(COMMIT_WORKERS, name_hint="compress_state_commit", deps=[pool_tid]):
+        commit_worker = pl.tile.get_block_idx()
+        for c_idx in pl.range(commit_worker, b_dim, COMMIT_WORKERS):
+            for s_idx in pl.range(s_dim):
+                token = c_idx * s_dim + s_idx
+                state_row_i64 = pl.read(state_slot_mapping, [token])
+                if state_row_i64 >= 0:
+                    state_row = pl.cast(state_row_i64, pl.INDEX)
+                    token_pos = pl.read(position_ids, [token])
+                    ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+                    compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = cmp4_kv_proj_pad[
+                        token : token + 1, 0 : OUT_DIM]
+                    compress_state_flat[state_row : state_row + 1, OUT_DIM : COMPRESS_STATE_DIM] = pl.add(
+                        cmp4_score_proj_pad[token : token + 1, 0 : OUT_DIM], ape[ape_row : ape_row + 1, 0 : OUT_DIM])
 
     normed_kv = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
