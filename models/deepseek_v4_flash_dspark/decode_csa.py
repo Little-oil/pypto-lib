@@ -141,6 +141,8 @@ IDX_MAX_BLOCKS = CMP_MAX_BLOCKS
 
 # tiling
 CSA_WB_TOKEN_TILE = 8
+# csa_cache_writeback runs on persistent workers, each striding over token tiles.
+CSA_WB_WORKERS = 48
 
 if T != LOCAL_T:
     raise ValueError(f"CSA token capacity {T} must equal TP local token capacity {LOCAL_T}")
@@ -320,17 +322,18 @@ def decode_csa(
 
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        with pl.spmd(kv_wb_blocks, name_hint="csa_cache_writeback") as ori_cache_write_tid:
-            wb_blk = pl.tile.get_block_idx()
-            wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
-            for write_dt in pl.range(CSA_WB_TOKEN_TILE):
-                write_t = wb_t0 + write_dt
-                write_row_i64 = pl.read(ori_slot_mapping, [write_t])
-                if write_row_i64 >= 0:
-                    write_row = pl.cast(write_row_i64, pl.INDEX)
-                    kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = (
-                        kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
-                    )
+        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback") as ori_cache_write_tid:
+            wb_worker = pl.tile.get_block_idx()
+            for wb_blk in pl.range(wb_worker, kv_wb_blocks, CSA_WB_WORKERS):
+                wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
+                for write_dt in pl.range(CSA_WB_TOKEN_TILE):
+                    write_t = wb_t0 + write_dt
+                    write_row_i64 = pl.read(ori_slot_mapping, [write_t])
+                    if write_row_i64 >= 0:
+                        write_row = pl.cast(write_row_i64, pl.INDEX)
+                        kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = (
+                            kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
+                        )
 
         # Hand the compressors scalar-extent views: their token and request axes
         # bind to one row count per call, and mixing them with the gathered
@@ -878,15 +881,16 @@ def decode_csa_tp1(
 
         ori_block_num = pl.tensor.dim(kv_cache, 0)
         kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-        with pl.spmd(wb_blocks, name_hint="csa_cache_writeback") as ori_cache_write_tid:
-            wb_blk = pl.tile.get_block_idx()
-            wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
-            for write_dt in pl.range(CSA_WB_TOKEN_TILE):
-                write_t = wb_t0 + write_dt
-                write_row_i64 = pl.read(ori_slot_mapping, [write_t])
-                if write_row_i64 >= 0:
-                    write_row = pl.cast(write_row_i64, pl.INDEX)
-                    kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+        with pl.spmd(CSA_WB_WORKERS, name_hint="csa_cache_writeback") as ori_cache_write_tid:
+            wb_worker = pl.tile.get_block_idx()
+            for wb_blk in pl.range(wb_worker, wb_blocks, CSA_WB_WORKERS):
+                wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
+                for write_dt in pl.range(CSA_WB_TOKEN_TILE):
+                    write_t = wb_t0 + write_dt
+                    write_row_i64 = pl.read(ori_slot_mapping, [write_t])
+                    if write_row_i64 >= 0:
+                        write_row = pl.cast(write_row_i64, pl.INDEX)
+                        kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
         cmp_out = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.FP32)
         cmp_out, cmp_cache_write_tid = compressor_ratio4(
