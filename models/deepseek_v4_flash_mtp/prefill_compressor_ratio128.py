@@ -39,6 +39,10 @@ NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
 MAX_SEQ_LEN = M.max_position_embeddings
 START_POS = 0
 COMPRESS_RATIO = 128
+# The compressed block table is indexed by the same logical page as the raw KV
+# cache, so a block holds BLOCK_SIZE / COMPRESS_RATIO rows. Callers that page
+# the compressed cache differently pass an equivalent one-row-per-block view --
+# this kernel only ever addresses cmp_kv as a flat row space.
 CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 OUT_DIM = HEAD_DIM
 STATE_LEN = COMPRESS_RATIO
@@ -301,7 +305,9 @@ def golden_prefill_compressor_ratio128(tensors):
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"]
-    cmp_kv_flat = tensors["cmp_kv"].view(HCA_CMP_BLOCK_NUM * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM)
+    # Leaf-composed CP callers intentionally pass a single physical cache
+    # block, while the standalone entry uses the full pool.
+    cmp_kv_flat = tensors["cmp_kv"].view(-1, HEAD_DIM)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
