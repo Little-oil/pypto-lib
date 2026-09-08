@@ -311,7 +311,7 @@ def compressor_ratio4_cache_write(
         sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
         for inner in pl.range(rms_blk_rows):
             compact_token = b0 + inner
-            request = compact_token // (s_dim // COMPRESS_RATIO)
+            request = (compact_token * COMPRESS_RATIO) // s_dim
             first_pos = pl.read(position_ids, [request * s_dim])
             token = compact_token * COMPRESS_RATIO + COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO
             cos_b = pl.gather_row(cos_b, cos, [inner, 0], [token, 0], [1, ROPE_HEAD_DIM])
@@ -348,7 +348,7 @@ def compressor_ratio4_cache_write(
 
         for inner in pl.range(rms_blk_rows):
             compact_token = b0 + inner
-            request = compact_token // (s_dim // COMPRESS_RATIO)
+            request = (compact_token * COMPRESS_RATIO) // s_dim
             first_pos = pl.read(position_ids, [request * s_dim])
             token = compact_token * COMPRESS_RATIO + COMPRESS_RATIO - 1 - first_pos % COMPRESS_RATIO
             cache_row_i64 = pl.read(cmp_slot_mapping, [token])
