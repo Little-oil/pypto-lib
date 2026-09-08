@@ -277,14 +277,24 @@ def decode_hca(
     with pl.spmd(kv_wb_blocks, name_hint="hca_cache_writeback", deps=[kv_gather_done_tid]) as ori_cache_write_tid:
         wb_blk = pl.tile.get_block_idx()
         wb_t0 = wb_blk * HCA_WB_TOKEN_TILE
-        for write_dt in pl.range(HCA_WB_TOKEN_TILE):
-            write_t = wb_t0 + write_dt
-            write_row_i64 = pl.read(ori_slot_mapping, [write_t])
-            if write_row_i64 >= 0:
-                write_row = pl.cast(write_row_i64, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = (
-                    kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
-                )
+        wb_first_i64 = pl.read(ori_slot_mapping, [wb_t0])
+        wb_contiguous = pl.cast(wb_first_i64 >= 0, pl.INT32)
+        for wb_dt in pl.unroll(1, HCA_WB_TOKEN_TILE):
+            wb_slot_i64 = pl.read(ori_slot_mapping, [wb_t0 + wb_dt])
+            wb_slot_matches = pl.cast(wb_slot_i64 == wb_first_i64 + wb_dt, pl.INT32)
+            wb_contiguous = wb_contiguous * wb_slot_matches
+        if wb_contiguous != 0:
+            wb_first = pl.cast(wb_first_i64, pl.INDEX)
+            wb_values = kv_full[wb_t0 : wb_t0 + HCA_WB_TOKEN_TILE, 0 : HEAD_DIM]
+            kv_cache_flat[wb_first : wb_first + HCA_WB_TOKEN_TILE, 0 : HEAD_DIM] = wb_values
+        else:
+            for write_dt in pl.range(HCA_WB_TOKEN_TILE):
+                write_t = wb_t0 + write_dt
+                write_row_i64 = pl.read(ori_slot_mapping, [write_t])
+                if write_row_i64 >= 0:
+                    write_row = pl.cast(write_row_i64, pl.INDEX)
+                    write_values = kv_full[write_t : write_t + 1, 0 : HEAD_DIM]
+                    kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = write_values
 
     # Hand the compressor scalar-extent views: its token and request axes bind to
     # one row count per call, and mixing them with the gathered stream's symbols
@@ -351,9 +361,9 @@ def decode_hca(
                 [H_TILE, 1],
                 target_memory=pl.MemorySpace.Vec,
             )
-            stream_swap_one = pl.full([1, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+            stream_swap_one = pl.tile.full([1, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
             stream_swap_index = pl.cast(
-                pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32),
+                pl.tile.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32),
                 target_type=pl.FP32,
             )
             stream_swap_col = pl.col_expand_mul(stream_swap_one, stream_swap_index)
@@ -368,9 +378,16 @@ def decode_hca(
                 pl.add(stream_swap_col, 1.0),
                 pl.mul(stream_swap_lane, 2.0),
             )
-            stream_swap_row = pl.cast(stream_swap, target_type=pl.INT32)
-            stream_swap_zero = pl.full([H_TILE, ROPE_HEAD_DIM], dtype=pl.INT32, value=0)
-            stream_swap_idx = pl.col_expand_add(stream_swap_zero, stream_swap_row)
+            stream_swap_zero = pl.tile.full([H_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+            stream_swap_source = pl.add(stream_swap, NOPE_DIM)
+            stream_swap_grid = pl.col_expand_add(stream_swap_zero, stream_swap_source)
+            stream_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
+            stream_row_ids_f = pl.cast(stream_row_ids, target_type=pl.FP32)
+            stream_row_offsets = pl.mul(stream_row_ids_f, HEAD_DIM)
+            stream_row_offsets_col = pl.reshape(stream_row_offsets, [H_TILE, 1])
+            stream_swap_flat = pl.row_expand_add(stream_swap_grid, stream_row_offsets_col)
+            stream_swap_idx = pl.cast(stream_swap_flat, target_type=pl.INT32)
+            stream_gather_tmp = pl.create_tile([H_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
             for pack_work in pl.range(worker, pack_work_count, ATTENTION_PUBLISH_WORKERS):
                 token_block = pack_work // (H // H_TILE)
                 stream_t0 = token_block * ATTENTION_PUBLISH_T_TILE
@@ -438,13 +455,11 @@ def decode_hca(
                     stream_sink_tile = pl.add(pl.sub(stream_m, stream_m), stream_sink)
                     stream_denom = pl.add(stream_l, pl.exp(pl.sub(stream_sink_tile, stream_m)))
                     stream_output = pl.row_expand_div(stream_o, stream_denom)
-                    pl.store(stream_output, [merge_state_row, 0], stream_heads)
-                    packed_stream_output = stream_heads[merge_state_row : merge_state_row + H_TILE, 0:HEAD_DIM]
-                    stream_bf16 = pl.cast(packed_stream_output, target_type=pl.BF16, mode="rint")
-                    stream_rope = packed_stream_output[0:H_TILE, NOPE_DIM:HEAD_DIM]
-                    stream_cos_il = rope_cos_il[merge_t : merge_t + 1, 0:ROPE_HEAD_DIM]
-                    stream_sin_signed = rope_sin_signed[merge_t : merge_t + 1, 0:ROPE_HEAD_DIM]
-                    stream_swapped = pl.gather(stream_rope, dim=-1, index=stream_swap_idx)
+                    stream_bf16 = pl.cast(stream_output, target_type=pl.BF16, mode="rint")
+                    stream_rope = stream_output[0:H_TILE, NOPE_DIM:HEAD_DIM]
+                    stream_cos_il = pl.load(rope_cos_il, [merge_t, 0], [1, ROPE_HEAD_DIM])
+                    stream_sin_signed = pl.load(rope_sin_signed, [merge_t, 0], [1, ROPE_HEAD_DIM])
+                    stream_swapped = pl.tile.gather(stream_output, stream_swap_idx, stream_gather_tmp)
                     stream_rot = pl.add(
                         pl.col_expand_mul(stream_rope, stream_cos_il),
                         pl.col_expand_mul(stream_swapped, stream_sin_signed),
@@ -454,14 +469,11 @@ def decode_hca(
                         stream_bf16[0:H_TILE, 0:NOPE_DIM],
                         stream_rope_bf16,
                     )
-                    for stream_hi in pl.unroll(H_TILE):
-                        stream_head = stream_h0 + stream_hi
-                        stream_pack_row = (stream_head // HEADS_PER_GROUP) * T_PAD + merge_t
-                        stream_pack_col = (stream_head % HEADS_PER_GROUP) * HEAD_DIM
-                        attention_grouped[
-                            stream_pack_row : stream_pack_row + 1,
-                            stream_pack_col : stream_pack_col + HEAD_DIM,
-                        ] = stream_full_bf16[stream_hi : stream_hi + 1, 0:HEAD_DIM]
+                    stream_groups = pl.reshape(stream_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
+                    for stream_group in pl.unroll(PUBLISH_GROUPS):
+                        stream_pack_row = (global_group0 + stream_group) * T_PAD + merge_t
+                        stream_group_values = pl.slice(stream_groups, [1, O_GROUP_IN], [stream_group, 0])
+                        pl.store(stream_group_values, [stream_pack_row, 0], attention_grouped)
 
                 for group_slot in pl.unroll(PUBLISH_GROUPS):
                     source_row = (global_group0 + group_slot) * T_PAD + stream_t0
