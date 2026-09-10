@@ -11,6 +11,9 @@ attention-normalized inputs for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
+from hc_pre import hc_pre
+from rmsnorm import rms_norm
+
 from config import (
     FLASH as M,
     DECODE_BATCH,
@@ -107,14 +110,16 @@ def materialize_rope_rows(
     rope_sin_t: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
 ):
     t_dim = pl.tensor.dim(position_ids, 0)
+    cos_rows = pl.reshape(rope_cos_t, [t_dim, ROPE_DIM])
+    sin_rows = pl.reshape(rope_sin_t, [t_dim, ROPE_DIM])
     for rope_t0 in pl.spmd(t_dim // KV_RMS_T_TILE, name_hint="qkv_rope_rows"):
         t0 = rope_t0 * KV_RMS_T_TILE
         for rope_dt in pl.range(KV_RMS_T_TILE):
             rope_t = t0 + rope_dt
             if rope_t < num_tokens:
                 rope_pos = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
-                rope_cos_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
-                rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
+                cos_rows[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
+                sin_rows[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
 
 
 @pl.jit.inline
@@ -220,11 +225,7 @@ def rope_prepare(
             )
             qrp_tail_sign = pl.sub(pl.mul(qrp_tail_lane, 2.0), 1.0)
             qrp_sin_signed_tail = pl.mul(qrp_sin_il_tail, qrp_tail_sign)
-            pl.store(
-                pl.set_validshape(qrp_cos_il_tail, qrp_valid_rows, ROPE_DIM),
-                [qrp_t0, 0],
-                rope_cos_il_view,
-            )
+            pl.store(pl.set_validshape(qrp_cos_il_tail, qrp_valid_rows, ROPE_DIM), [qrp_t0, 0], rope_cos_il_view)
             pl.store(
                 pl.set_validshape(qrp_sin_signed_tail, qrp_valid_rows, ROPE_DIM),
                 [qrp_t0, 0],
@@ -271,9 +272,7 @@ def q_proj_rope(
                         qr_seed = pl.full([QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0)
                         qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = qr_seed
 
-            for qbg_idx in pl.spmd(
-                (Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True
-            ):
+            for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
                 q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
                 qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
                 for t0 in pl.range(0, qr_t_matmul, QR_M_TILE):
@@ -756,8 +755,6 @@ def qkv_proj_rope(
 ):
     t_dim = pl.tensor.dim(x, 0)
     x_view = pl.reshape(x, [t_dim, D])
-    rope_cos_view = pl.reshape(rope_cos, [t_dim, ROPE_DIM])
-    rope_sin_view = pl.reshape(rope_sin, [t_dim, ROPE_DIM])
     kv_view = pl.reshape(kv, [t_dim, HEAD_DIM])
     qr_view = pl.reshape(qr, [t_dim, Q_LORA])
     qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
@@ -769,32 +766,7 @@ def qkv_proj_rope(
     q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
-    for qrp_idx in pl.spmd(t_dim // Q_ROPE_T_TILE, name_hint="q_rope_prepare", allow_early_resolve=True):
-        qrp_t0 = qrp_idx * Q_ROPE_T_TILE
-        qrp_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        qrp_idx_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
-        qrp_idx_fp32 = pl.cast(qrp_idx_i32, target_type=pl.FP32)
-        qrp_col = pl.col_expand_mul(qrp_ones, qrp_idx_fp32)
-        qrp_half = pl.mul(qrp_col, 0.5)
-        qrp_dup_i32 = pl.cast(qrp_half, target_type=pl.INT32, mode="trunc")
-        qrp_dup_f = pl.cast(qrp_dup_i32, target_type=pl.FP32)
-        qrp_dup_idx = pl.cast(qrp_dup_f, target_type=pl.INT32)
-        qrp_lane = pl.sub(qrp_col, pl.mul(qrp_dup_f, 2.0))
-        qrp_next_col = pl.add(qrp_col, 1.0)
-        qrp_lane_offset = pl.mul(qrp_lane, 2.0)
-        qrp_swap_f = pl.sub(qrp_next_col, qrp_lane_offset)
-        qrp_swap_idx = pl.cast(qrp_swap_f, target_type=pl.INT32)
-        qrp_sign = pl.sub(pl.mul(qrp_lane, 2.0), 1.0)
-        qrp_cos_rows = rope_cos_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
-        qrp_sin_rows = rope_sin_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
-        qrp_cos = pl.cast(qrp_cos_rows, target_type=pl.FP32)
-        qrp_sin = pl.cast(qrp_sin_rows, target_type=pl.FP32)
-        qrp_cos_il = pl.gather(qrp_cos, dim=-1, index=qrp_dup_idx)
-        qrp_sin_il = pl.gather(qrp_sin, dim=-1, index=qrp_dup_idx)
-        qrp_sin_signed = pl.mul(qrp_sin_il, qrp_sign)
-        q_rope_cos_il[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_cos_il
-        q_rope_sin_signed[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_sin_signed
-        q_rope_swap_idx[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_swap_idx
+    rope_prepare(rope_cos, rope_sin, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx)
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
     # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
@@ -997,7 +969,7 @@ def qkv_proj_rope(
         #   out[j] = n[j]*cos_il[j] + n[j^1]*sin_il_signed[j]
         #
         # q_rope_prepare above already built cos_il / sign-folded sin / swap_idx over the
-        # full [t_dim, ROPE_DIM] token rows from the same rope_cos_view -- slice them here
+        # full [t_dim, ROPE_DIM] token rows from the same RoPE inputs -- slice them here
         # instead of re-running the arange chain and re-gathering the same two tables.
         # Values are bit-identical: same source rows, same j>>1 index, and folding the
         # +/-1 sign into sin only flips a sign bit, so (n[j^1]*sign)*sin == n[j^1]*(sin*sign).
@@ -1013,6 +985,39 @@ def qkv_proj_rope(
         kv_view[tg : tg + KV_RMS_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = kv_rope_i16
 
     return q
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_attention_prolog(
+    x_hc: pl.Tensor[[T_DYN, M.hc_mult, D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[M.mix_hc, M.hc_dim], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[M.mix_hc], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    normed: pl.Tensor[[T_DYN, D], pl.BF16],
+    post: pl.Tensor[[T_DYN, M.hc_mult], pl.FP32],
+    comb: pl.Tensor[[T_DYN, M.hc_mult * M.hc_mult], pl.FP32],
+    cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+):
+    """Shared HC mixing, attention normalization, and query projection."""
+    rows = pl.tensor.dim(x_hc, 0)
+    mixed = pl.create_tensor([rows, D], dtype=pl.BF16)
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, mixed, post, comb)
+    rms_tid = rms_norm(mixed, attn_norm_w, normed)
+    rope_prepare(rope_cos, rope_sin, cos_il, sin_signed, swap_idx)
+    q_proj_rope(normed, wq_a, wq_b, wq_b_scale, gamma_cq, cos_il, sin_signed, swap_idx, q, qr, qr_scale)
+    return rms_tid
 
 
 @pl.jit
@@ -1184,14 +1189,10 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run
 
-    MODES = {
-        "decode":  (DECODE_BATCH, DECODE_SEQ),
-        "prefill": (PREFILL_BATCH, PREFILL_SEQ),
-    }
+    MODES = { "decode":  (DECODE_BATCH, DECODE_SEQ), "prefill": (PREFILL_BATCH, PREFILL_SEQ), }
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
                         help="Use decode or prefill batch sizes, or 'all' to test both.")

@@ -258,51 +258,6 @@ def swa_indices_and_lens(
     return indices, lens
 
 
-def history_window_swa_indices_and_lens(
-    positions: torch.Tensor,
-    window_block_table: torch.Tensor,
-    *,
-    block_size: int = BLOCK_SIZE,
-    window: int = M.sliding_window,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Lower historical HCA/CSA window rows to physical KV-cache slots.
-
-    Current decode-chunk positions are excluded from this list because HCA/CSA
-    still attend current MTP tokens through their overlay raw-index range. The
-    returned rows are packed oldest-to-newest; invalid tail columns are -1. The
-    block table follows the same vLLM-style absolute logical block contract as
-    SWA, while physical blocks may still be a small sliding-window ring.
-    """
-    if positions.ndim != 2:
-        raise ValueError("history window indices expect positions with shape [B, S]")
-    positions_i64 = positions.to(torch.int64)
-    table_i64 = window_block_table.to(device=positions.device, dtype=torch.int64)
-    batch, seq = positions_i64.shape
-    indices = torch.full((batch * seq, window), -1, dtype=torch.int32, device=positions.device)
-    lens = torch.zeros((batch * seq,), dtype=torch.int32, device=positions.device)
-
-    for b in range(batch):
-        for s in range(seq):
-            t = b * seq + s
-            abs_pos = int(positions_i64[b, s].item())
-            overlay_positions = {int(positions_i64[b, os].item()) for os in range(s + 1)}
-            start = max(0, abs_pos - window + 1)
-            out_k = 0
-            for pos in range(start, abs_pos + 1):
-                if pos in overlay_positions:
-                    continue
-                logical_blk = pos // block_size
-                intra = pos % block_size
-                if logical_blk >= table_i64.shape[1]:
-                    continue
-                blk = int(table_i64[b, logical_blk].item())
-                if blk >= 0:
-                    indices[t, out_k] = blk * block_size + intra
-                    out_k += 1
-            lens[t] = out_k
-    return indices, lens
-
-
 def compressed_slot_mapping(
     positions: torch.Tensor,
     cmp_block_table: torch.Tensor,
@@ -445,9 +400,7 @@ def precompute_freqs_cos_sin(
     out_device = torch.device(device) if device is not None else None
     half_dim = dim // 2
 
-    inv_freq = 1.0 / (
-        float(base) ** (torch.arange(0, dim, 2, dtype=torch.float32, device=out_device) / dim)
-    )
+    inv_freq = 1.0 / (float(base) ** (torch.arange(0, dim, 2, dtype=torch.float32, device=out_device) / dim))
     if original_seq_len > 0:
         low, high = _find_correction_range(beta_fast, beta_slow, dim, float(base), int(original_seq_len))
         smooth = 1 - _linear_ramp_factor(low, high, half_dim, device=out_device)
@@ -519,7 +472,8 @@ def int8_quant_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     rows = x.float().reshape(-1, x.shape[-1])
     amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
+    # Explicit division preserves half-amax ties as in device pl.div.
+    scale_quant = torch.div(torch.full_like(amax, INT8_SCALE_MAX), amax)
     scaled = rows * scale_quant
     out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dequant = 1.0 / scale_quant
