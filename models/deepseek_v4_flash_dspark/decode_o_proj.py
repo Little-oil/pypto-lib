@@ -280,8 +280,8 @@ def o_group_a2a_gather(
     return local_groups_out
 
 
-@pl.jit.inline
-def o_group_a2a(
+@pl.jit.inline(auto_scope=False)
+def o_group_a2a_with_completion(
     local_groups_out: pl.Tensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     exchange_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -290,7 +290,7 @@ def o_group_a2a(
     local_t: pl.Scalar[pl.INT32],
     publish_dep: pl.Scalar[pl.TASK_ID],
     publish_count: pl.Scalar[pl.INT32],
-):
+) -> tuple[pl.Tensor, pld.DistributedTensor, pl.Scalar[pl.TASK_ID]]:
     """Finish a non-overlapping producer-fused exchange and release its window."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_group_a2a_wait", deps=[publish_dep]) as wait_tid:
         expected = pl.cast(publish_count, pl.INT32)
@@ -309,7 +309,7 @@ def o_group_a2a(
         core_num=ATTENTION_PUBLISH_WORKERS, deps=[wait_tid],
     )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_group_a2a_complete", deps=[gather_tid], no_dep_args=[exchange_signal]):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_group_a2a_complete", deps=[gather_tid], no_dep_args=[exchange_signal]) as completion_tid:
         completion_anchor = pl.read(local_groups_out, [0, 0])
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:
@@ -343,6 +343,25 @@ def o_group_a2a(
                     op=pld.NotifyOp.AtomicAdd,
                 )
         pl.write(local_groups_out, [0, 0], completion_anchor)
+    return local_groups_out, exchange_signal, completion_tid
+
+
+@pl.jit.inline
+def o_group_a2a(
+    local_groups_out: pl.Tensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
+    exchange_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
+    publish_dep: pl.Scalar[pl.TASK_ID],
+    publish_count: pl.Scalar[pl.INT32],
+):
+    """Finish the attention exchange while preserving the two-result API."""
+    local_groups_out, exchange_signal, _completion_tid = o_group_a2a_with_completion(
+        local_groups_out, exchange_window, exchange_signal,
+        group_base, tp_rank, local_t, publish_dep, publish_count,
+    )
     return local_groups_out, exchange_signal
 
 
