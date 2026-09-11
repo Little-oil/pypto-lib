@@ -92,7 +92,7 @@ from qkv_proj_rope import (
     q_proj_q_matmul,
     q_proj_qr,
     qkv_proj_rope,
-    rope_prepare,
+    rope_prepare_after,
 )
 from decode_o_proj import (
     ATTENTION_WINDOW_ROWS,
@@ -317,7 +317,8 @@ def decode_csa(
         q_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         q_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
         q_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-        rope_prepare(freqs_cos, freqs_sin, q_cos_il, q_sin_signed, q_swap_idx)
+        # Defer non-critical RoPE preparation until mixed activations are normalized.
+        rope_prepare_after(freqs_cos, freqs_sin, q_cos_il, q_sin_signed, q_swap_idx, rms_tid)
 
         qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
         qr_scale_pad = pl.create_tensor([QPROJ_T_PAD, 1], dtype=pl.FP32)

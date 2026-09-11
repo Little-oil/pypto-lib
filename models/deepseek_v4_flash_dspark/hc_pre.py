@@ -151,7 +151,12 @@ def hc_pre_gates(
     # comb_sinkhorn: reduce comb partials at cols 8/12/16/20, softmax, then a
     # column-first 20-iteration Sinkhorn -> comb.
     comb_tail_store = pl.create_tensor([COMB_T_TILE, HC_PAD * HC_MULT], dtype=pl.FP32)
-    for ob in pl.spmd(token_tiles, name_hint="comb_sinkhorn", allow_early_resolve=True):
+    # Keep this non-critical consumer out of speculative dispatch.
+    seed_dummy = pl.system.task_dummy(deps=[])
+    with pl.spmd(
+        token_tiles, name_hint="comb_sinkhorn", deps=[seed_dummy], allow_early_resolve=True
+    ) as comb_tid:
+        ob = pl.tile.get_block_idx()
         t0 = ob * COMB_T_TILE
         valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
         inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], valid_shape=[valid_rows, 1], target_memory=pl.MemorySpace.Vec)
