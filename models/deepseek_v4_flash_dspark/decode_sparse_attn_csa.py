@@ -132,7 +132,7 @@ def sparse_attn_csa(
     # Every token tile is independent: it reads its own idx_topk / position_ids /
     # window_swa_indices rows and writes its own cmp_sparse_indices, valid_block_mask
     # and sparse_bias rows, so the tiles spread over lanes instead of one core.
-    with pl.spmd(CSA_PLAN_WORKERS, name_hint="csa_slots_build_valid_qk_plan") as qk_plan_tid:
+    with pl.spmd(CSA_PLAN_WORKERS, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
         plan_worker = pl.tile.get_block_idx()
         # Valid compressed slots.
         for bias_t0 in pl.range(plan_worker * BIAS_T_TILE, t_dim, CSA_PLAN_WORKERS * BIAS_T_TILE):
