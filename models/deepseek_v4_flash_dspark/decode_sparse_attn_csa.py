@@ -58,6 +58,7 @@ CMP_MAX_BLOCKS = (MAX_SEQ_LEN // COMPRESS_RATIO + BLOCK_SIZE - 1) // BLOCK_SIZE
 
 # tiling
 H_TILE = 16
+MERGE_WORKERS = 48
 QK_PRE_LAUNCH = 2
 QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
 QK_KV_READY_EVENT = 0
@@ -92,6 +93,8 @@ if T % BIAS_T_TILE != 0:
     raise ValueError("CSA token capacity must contain complete bias tiles")
 if H_TILE % HEADS_PER_GROUP != 0:
     raise ValueError(f"CSA head tile {H_TILE} must contain complete output groups")
+if PUBLISH_GROUPS != 2:
+    raise ValueError("CSA TP1 merge requires exactly two output groups per head tile")
 if O_GROUPS % TP != 0:
     raise ValueError(f"output groups {O_GROUPS} must be divisible by TP size {TP}")
 if LOCAL_O_GROUPS % PUBLISH_GROUPS != 0:
@@ -417,35 +420,50 @@ def sparse_attn_csa_tp1(
     )
     t_dim = pl.tensor.dim(q, 0)
 
-    with pl.spmd(t_dim * (H // H_TILE), name_hint="merge_norm", deps=[qk_tid, rope_tid]) as merge_tid:
-        m_idx = pl.tile.get_block_idx()
-        m_t = m_idx // (H // H_TILE)
-        m_h_idx = m_idx - m_t * (H // H_TILE)
-        m_h0 = m_h_idx * H_TILE
-        m_row = m_idx * H_TILE
-        m_mi = attn_mi[m_row : m_row + H_TILE, 0:1]
-        m_li = attn_li[m_row : m_row + H_TILE, 0:1]
-        m_oi = attn_oi[m_row : m_row + H_TILE, 0:HEAD_DIM]
+    merge_sink = pl.reshape(attn_sink, [H, 1])
+    with pl.spmd(MERGE_WORKERS, name_hint="merge_norm", deps=[qk_tid, rope_tid]) as merge_tid:
+        m_worker = pl.tile.get_block_idx()
+        m_swap = pl.load(rope_swap_idx, [0, 0], [H_TILE, ROPE_DIM])
+        m_swap_f = pl.cast(m_swap, target_type=pl.FP32)
+        m_swap_source = pl.add(m_swap_f, NOPE_DIM)
+        m_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
+        m_row_ids_f = pl.cast(m_row_ids, target_type=pl.FP32)
+        m_row_offsets = pl.mul(m_row_ids_f, HEAD_DIM)
+        m_row_offsets_col = pl.reshape(m_row_offsets, [H_TILE, 1])
+        m_swap_flat = pl.row_expand_add(m_swap_source, m_row_offsets_col)
+        m_swap_idx = pl.cast(m_swap_flat, target_type=pl.INT32)
+        m_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
+        for m_idx in pl.range(m_worker, t_dim * (H // H_TILE), MERGE_WORKERS):
+            m_t = m_idx // (H // H_TILE)
+            m_h_idx = m_idx - m_t * (H // H_TILE)
+            m_h0 = m_h_idx * H_TILE
+            m_row = m_idx * H_TILE
+            m_mi = pl.load(attn_mi, [m_row, 0], [H_TILE, 1])
+            m_li = pl.load(attn_li, [m_row, 0], [H_TILE, 1])
+            m_oi = pl.load(attn_oi, [m_row, 0], [H_TILE, HEAD_DIM])
 
-        n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
-        n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
-        n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-        n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
-        n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
+            n_sink_bias = pl.load(merge_sink, [m_h0, 0], [H_TILE, 1])
+            n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
+            n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
+            n_full = pl.row_expand_div(m_oi, n_denom)
+            n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
-        # Inverse-RoPE head tile.
-        m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
-        m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
-        m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
-        m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[0:H_TILE, 0:ROPE_DIM])
-        m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
-        n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-        n_full_bf16 = pl.concat(n_bf16[:, : NOPE_DIM], n_rope_bf16)
+            # Inverse-RoPE head tile.
+            m_rope = n_full[0:H_TILE, NOPE_DIM:HEAD_DIM]
+            m_cos_il = pl.load(rope_cos_il, [m_t, 0], [1, ROPE_DIM])
+            m_sin_signed = pl.load(rope_sin_signed, [m_t, 0], [1, ROPE_DIM])
+            m_swapped = pl.tile.gather(n_full, m_swap_idx, m_gather_tmp)
+            m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
+            n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
+            n_full_bf16 = pl.concat(n_bf16[0:H_TILE, 0:NOPE_DIM], n_rope_bf16)
 
-        n_group_bf16 = pl.reshape(n_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
-        for n_group in pl.unroll(PUBLISH_GROUPS):
-            n_pack_row = (m_h0 // HEADS_PER_GROUP + n_group) * T_PAD + m_t
-            o_packed_heads[n_pack_row : n_pack_row + 1, 0:O_GROUP_IN] = n_group_bf16[n_group : n_group + 1, :]
+            n_group_bf16 = pl.reshape(n_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
+            n_pack_first = n_group_bf16[0:1, 0:O_GROUP_IN]
+            n_pack_second = n_group_bf16[1:2, 0:O_GROUP_IN]
+            n_pack_row = (m_h0 // HEADS_PER_GROUP) * T_PAD + m_t
+            n_pack_row_second = n_pack_row + T_PAD
+            pl.store(n_pack_first, [n_pack_row, 0], o_packed_heads)
+            pl.store(n_pack_second, [n_pack_row_second, 0], o_packed_heads)
 
     return o_packed_heads, merge_tid
 
