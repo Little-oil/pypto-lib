@@ -569,7 +569,7 @@ def indexer_score_topk_forest(
         max_topk_cache_len = pl.max(max_topk_cache_len, topk_cache_len)
     with pl.scope():
         if max_topk_cache_len <= TOPK_CANDIDATES_PER_LEAF * TOPK_LEAVES_PER_GROUP:
-            with pl.spmd(TOPK_GROUP_WORKERS, name_hint="indexer_topk_single_group_publish", deps=[score_tid]):
+            with pl.spmd(TOPK_GROUP_WORKERS, name_hint="indexer_topk_single_group_publish", deps=[score_tid], allow_early_resolve=True):
                 indexer_topk_single_group_publish(
                     position_ids, kv_seq_lens,
                     score_arena, pair_arena,

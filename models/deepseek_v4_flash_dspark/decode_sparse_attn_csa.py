@@ -132,7 +132,7 @@ def sparse_attn_csa(
     # Every token tile is independent: it reads its own idx_topk / position_ids /
     # window_swa_indices rows and writes its own cmp_sparse_indices, valid_block_mask
     # and sparse_bias rows, so the tiles spread over lanes instead of one core.
-    with pl.spmd(CSA_PLAN_WORKERS, name_hint="csa_slots_build_valid_qk_plan") as qk_plan_tid:
+    with pl.spmd(CSA_PLAN_WORKERS, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
         plan_worker = pl.tile.get_block_idx()
         # Valid compressed slots.
         for bias_t0 in pl.range(plan_worker * BIAS_T_TILE, t_dim, CSA_PLAN_WORKERS * BIAS_T_TILE):
@@ -200,6 +200,7 @@ def sparse_attn_csa(
             qk_q = pl.load(
                 q_flat, [qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
             )
+            qk_l1 = pl.create_tile([QK_TRANSFER_SLOTS * ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
             for qk_tick in pl.range(SPARSE_BLOCKS + QK_PRE_LAUNCH):
                 if qk_tick < SPARSE_BLOCKS:
                     qk_sb = qk_tick
@@ -208,11 +209,13 @@ def sparse_attn_csa(
                         qk_kv_row = qk_slot * ATTN_K_TILE
                         qk_transfer_row = qk_slot * H
                         pl.system.sync_wait(QK_KV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
-                        qk_kv = pl.load(
-                            kv_transfer, [qk_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
-                            target_memory=pl.MemorySpace.Mat,
+                        qk_l1_row = (qk_sb % QK_TRANSFER_SLOTS) * ATTN_K_TILE
+                        qk_l1 = pl.gather_row(
+                            qk_l1, kv_transfer, [qk_l1_row, 0], [qk_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
                         )
-                        qk_scores = pl.matmul(qk_q, pl.tile.transpose_view(qk_kv), out_dtype=pl.FP32)
+                        qk_l1_t = pl.tile.transpose_view(qk_l1)
+                        qk_kv_t = pl.tile.slice(qk_l1_t, [HEAD_DIM, ATTN_K_TILE], [0, qk_l1_row])
+                        qk_scores = pl.matmul(qk_q, qk_kv_t, out_dtype=pl.FP32)
                         pl.store(qk_scores, [qk_transfer_row, 0], score_transfer)
                         pl.system.sync_set(
                             QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX,
@@ -222,17 +225,14 @@ def sparse_attn_csa(
                     pv_sb = qk_tick - QK_PRE_LAUNCH
                     if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
                         pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
-                        pv_kv_row = pv_slot * ATTN_K_TILE
                         pv_transfer_row = pv_slot * H
                         pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                         pv_probability = pl.load(
                             probability_transfer, [pv_transfer_row, 0], [H, ATTN_K_TILE],
                             target_memory=pl.MemorySpace.Mat,
                         )
-                        pv_kv = pl.load(
-                            kv_transfer, [pv_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
-                            target_memory=pl.MemorySpace.Mat,
-                        )
+                        pv_l1_row = (pv_sb % QK_TRANSFER_SLOTS) * ATTN_K_TILE
+                        pv_kv = pl.tile.slice(qk_l1, [ATTN_K_TILE, HEAD_DIM], [pv_l1_row, 0])
                         pv_output = pl.matmul(pv_probability, pv_kv, out_dtype=pl.FP32)
                         pl.store(pv_output, [pv_transfer_row, 0], pv_transfer)
                         pl.system.sync_set(
@@ -250,7 +250,7 @@ def sparse_attn_csa(
                 running_left = pl.tile.full([H // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
                 running_right = pl.tile.full([H // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
                 for qk_tick, (m_iter, l_iter, left_iter, right_iter) in pl.range(
-                    SPARSE_BLOCKS + QK_PRE_LAUNCH,
+                    SPARSE_BLOCKS + QK_PRE_LAUNCH + 1,
                     init_values=(running_m, running_l, running_left, running_right),
                 ):
                     if qk_tick < SPARSE_BLOCKS:
@@ -289,10 +289,12 @@ def sparse_attn_csa(
                                                 qk_kv_half, cmp_kv_flat, [qk_row, 0], [qk_src, 0], [1, HEAD_DIM],
                                             )
                             pl.store(qk_kv_half, [qk_kv_row + qk_lane_kv, 0], kv_transfer)
-                            pl.system.sync_set(
-                                QK_KV_READY_EVENT, pipe=pl.PipeType.MTE3,
-                                ffts_mode=2, core_type=pl.KernelType.AIV,
-                            )
+                    if qk_tick > 0 and qk_tick <= SPARSE_BLOCKS:
+                        softmax_sb = qk_tick - 1
+                        if pl.read(valid_block_mask, [qk_t, softmax_sb]) > 0:
+                            qk_slot = qk_core * QK_TRANSFER_SLOTS + softmax_sb % QK_TRANSFER_SLOTS
+                            qk_transfer_row = qk_slot * H
+                            qk_s0 = softmax_sb * ATTN_K_TILE
                             pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
                             qk_scores_half = pl.load(
                                 score_transfer, [qk_transfer_row + qk_lane_head, 0], [H // 2, ATTN_K_TILE],
@@ -314,8 +316,15 @@ def sparse_attn_csa(
                                 QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE3,
                                 ffts_mode=2, core_type=pl.KernelType.AIV,
                             )
-                    if qk_tick >= QK_PRE_LAUNCH:
-                        pv_sb = qk_tick - QK_PRE_LAUNCH
+                    # Publish the next KV-ready event after the preceding softmax stores.
+                    if qk_tick < SPARSE_BLOCKS:
+                        if pl.read(valid_block_mask, [qk_t, qk_tick]) > 0:
+                            pl.system.sync_set(
+                                QK_KV_READY_EVENT, pipe=pl.PipeType.MTE3,
+                                ffts_mode=2, core_type=pl.KernelType.AIV,
+                            )
+                    if qk_tick >= QK_PRE_LAUNCH + 1:
+                        pv_sb = qk_tick - QK_PRE_LAUNCH - 1
                         if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
                             pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
                             pv_transfer_row = pv_slot * H
@@ -595,6 +604,7 @@ def build_tensor_specs(
     all_invalid_fixture: bool = False,
     start_pos=None,
     batch: int = B,
+    block_holes_fixture: bool = False,
 ):
     """Build deterministic demo tensors for the CSA standalone harness."""
     import torch
@@ -627,6 +637,8 @@ def build_tensor_specs(
     shared_window_block_table = block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
     shared_swa_metadata = swa_indices_and_lens(positions, shared_window_block_table, block_size=BLOCK_SIZE, window=WIN)
     shared_swa_indices = shared_swa_metadata[0].contiguous()
+    if block_holes_fixture:
+        shared_swa_indices[::4, :] = -1
     if all_invalid_fixture:
         shared_swa_indices.fill_(-1)
 
@@ -665,7 +677,9 @@ def build_tensor_specs(
         return torch.rand(cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
 
     def init_attn_sink():
-        """Initialize the per-head sink logits to zero."""
+        """Initialize the per-head sink logits."""
+        if block_holes_fixture:
+            return torch.linspace(-2.0, 2.0, H)
         return torch.zeros(H)
 
     def init_window_block_table():
@@ -693,6 +707,11 @@ def build_tensor_specs(
                 spread = torch.arange(valid, dtype=torch.int64) * (int(visible) - 1)
                 candidates = torch.div(spread, valid - 1, rounding_mode="floor")
             indices[token, :valid] = candidates.to(torch.int32)
+        if block_holes_fixture:
+            indices[:, :ATTN_K_TILE] = -1
+            indices[:, 2 * ATTN_K_TILE : 3 * ATTN_K_TILE] = -1
+            indices[::4, :CMP_TOPK - 1] = -1
+            indices[1::4, :] = -1
         if cache_window_replacement_fixture:
             indices[:, :] = -1
         if causal_regression_fixture:
@@ -769,6 +788,10 @@ if __name__ == "__main__":
         help="Mask every raw and compressed row.",
     )
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument(
+        "--block-holes-fixture", action="store_true", default=False,
+        help="Use invalid sparse blocks between valid blocks and signed sink logits.",
+    )
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument(
         "--enable-dep-gen", action="store_true", default=False,
@@ -798,7 +821,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(
             args.causal_regression_fixture, args.short_window_fixture, args.mixed_topk_fixture,
             args.cache_window_replacement_fixture, args.all_invalid_fixture,
-            start_pos=start_pos, batch=args.batch,
+            start_pos=start_pos, batch=args.batch, block_holes_fixture=args.block_holes_fixture,
         ),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,
