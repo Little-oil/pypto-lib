@@ -513,7 +513,7 @@ def indexer_score_topk_forest(
                         [1, IDX_N_HEADS],
                     )
                     query_weight = weights[query : query + 1, 0:IDX_N_HEADS]
-                for score_begin in pl.range(0, valid_count, SCORE_TILE):
+                for score_begin in pl.pipeline(0, valid_count, SCORE_TILE, stage=2):
                     logical_row = logical_begin + score_begin
                     valid_rows = pl.min(SCORE_TILE, valid_count - score_begin)
                     kv_i8 = pl.create_l1([SCORE_TILE, IDX_HEAD_DIM], pl.INT8)
