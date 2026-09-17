@@ -404,7 +404,7 @@ def indexer_score_topk_forest(
                         [1, IDX_N_HEADS],
                     )
                     query_weight = weights[query : query + 1, 0:IDX_N_HEADS]
-                    head_coefficient = pl.mul(query_scale, query_weight)
+                    head_coefficient = pl.reshape(pl.mul(query_scale, query_weight), [IDX_N_HEADS, 1])
                 for score_begin in pl.pipeline(0, lane_span, SCORE_LANE_ROWS, stage=2):
                     read_begin = score_begin * (1 + single_leaf)
                     kv_i8 = pl.create_l1([SCORE_TILE, IDX_HEAD_DIM], pl.INT8)
@@ -419,9 +419,10 @@ def indexer_score_topk_forest(
                             kv_i8, kv_cache_i8_flat, [page_begin, 0], [physical_row, 0],
                             [BLOCK_SIZE, IDX_HEAD_DIM],
                         )
-                    score_i32 = pl.matmul(kv_i8, query_vector, out_dtype=pl.INT32, b_trans=True)
-                    # Keep all heads for a candidate on one lane; shard candidate rows.
-                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    # Reduce over heads with col_sum to avoid the large row_sum UB scratch.
+                    score_i32 = pl.matmul(query_vector, kv_i8, out_dtype=pl.INT32, b_trans=True)
+                    # Each lane keeps all heads and owns a contiguous candidate-column range.
+                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
                         lane_begin = aiv_id * lane_stride
                         lane_valid_rows = pl.max(pl.min(valid_count - read_begin - lane_begin, SCORE_LANE_ROWS), 0)
                         kv_scale = pl.create_tensor([1, SCORE_LANE_ROWS], dtype=pl.FP32)
@@ -443,8 +444,8 @@ def indexer_score_topk_forest(
                         score_shard = pl.aiv_shard(score_i32)
                         score_fp32 = pl.cast(score_shard, target_type=pl.FP32, mode="none")
                         score_fp32 = pl.maximum(score_fp32, 0.0)
-                        score_fp32 = pl.col_expand_mul(score_fp32, head_coefficient)
-                        score_sum = pl.row_sum(score_fp32)
+                        score_fp32 = pl.row_expand_mul(score_fp32, head_coefficient)
+                        score_sum = pl.col_sum(score_fp32)
                         score_row = pl.reshape(score_sum, [1, SCORE_LANE_ROWS])
                         score_row = pl.mul(score_row, kv_scale)
                         score_valid = pl.fillpad(
