@@ -95,8 +95,10 @@ TOPK_ROWS_PER_QUERY = TOPK_MAX_LEAVES * 2
 TOPK_QUERY_WORKERS = 48  # Top-K query-merge workers
 TOPK_ARENA_ROWS = T_PAD * TOPK_ROWS_PER_QUERY
 TOPK_SCORE_WORKERS = 24  # Top-K score workers
-SCORE_TILE = 256
+SCORE_TILE = 384
 SCORE_LANE_ROWS = SCORE_TILE // 2
+# Pad score rows because the last tile can cross an 8192-candidate leaf.
+SCORE_ARENA_COLS = ((TOPK_CANDIDATES_PER_LEAF + SCORE_TILE - 1) // SCORE_TILE) * SCORE_TILE
 SCORE_ARENA_ROWS = max(T_PAD, TOPK_SCORE_WORKERS * 2)
 
 
@@ -124,7 +126,7 @@ def merge2_top512_pairs(
 
 @pl.jit.inline
 def indexer_topk_half_leaf(
-    score_arena: pl.Tensor[[SCORE_ARENA_ROWS, TOPK_CANDIDATES_PER_LEAF], pl.FP32],
+    score_arena: pl.Tensor[[SCORE_ARENA_ROWS, SCORE_ARENA_COLS], pl.FP32],
     pair_arena: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
     score_row: pl.Scalar[pl.INDEX],
     logical_begin: pl.Scalar[pl.INDEX],
@@ -245,7 +247,7 @@ def indexer_topk_query_merge(
 
 @pl.jit.inline
 def indexer_topk_leaf_publish(
-    score_arena: pl.Tensor[[SCORE_ARENA_ROWS, TOPK_CANDIDATES_PER_LEAF], pl.FP32],
+    score_arena: pl.Tensor[[SCORE_ARENA_ROWS, SCORE_ARENA_COLS], pl.FP32],
     query: pl.Scalar[pl.INDEX],
     valid_count: pl.Scalar[pl.INDEX],
     topk_scores: pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32],
@@ -312,7 +314,7 @@ def indexer_topk_leaf_publish(
 def indexer_topk_single_leaf_publish(
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
-    score_arena: pl.Tensor[[SCORE_ARENA_ROWS, TOPK_CANDIDATES_PER_LEAF], pl.FP32],
+    score_arena: pl.Tensor[[SCORE_ARENA_ROWS, SCORE_ARENA_COLS], pl.FP32],
     topk_scores: pl.Tensor[[T_DYN, IDX_TOPK], pl.FP32],
     topk_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
 ):
@@ -365,7 +367,7 @@ def indexer_score_topk_forest(
     )
     # The whole batch uses query rows for one leaf, or private lane rows for multiple leaves.
     score_arena = pl.create_tensor(
-        [SCORE_ARENA_ROWS, TOPK_CANDIDATES_PER_LEAF], dtype=pl.FP32
+        [SCORE_ARENA_ROWS, SCORE_ARENA_COLS], dtype=pl.FP32
     )
     with pl.spmd(
         TOPK_SCORE_WORKERS,
@@ -393,7 +395,11 @@ def indexer_score_topk_forest(
             logical_begin = leaf * TOPK_CANDIDATES_PER_LEAF
             if logical_begin < visible_count:
                 valid_count = pl.min(TOPK_CANDIDATES_PER_LEAF, visible_count - logical_begin)
-                lane_span = ((valid_count + SCORE_TILE - 1) // SCORE_TILE) * SCORE_LANE_ROWS
+                # Each half-leaf must fit the 4096-candidate sort path.
+                lane_span = pl.min(
+                    ((valid_count + SCORE_TILE - 1) // SCORE_TILE) * SCORE_LANE_ROWS,
+                    TOPK_CANDIDATES_PER_LEAF // 2,
+                )
                 lane_stride = single_leaf * SCORE_LANE_ROWS + (1 - single_leaf) * lane_span
                 query_head_begin = query * IDX_N_HEADS
                 query_vector = qr_hadamard_i8[query_head_begin : query_head_begin + IDX_N_HEADS, 0:IDX_HEAD_DIM]
