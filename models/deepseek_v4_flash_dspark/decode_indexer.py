@@ -423,7 +423,7 @@ def indexer_score_topk_forest(
                             kv_i8, kv_cache_i8_flat, [page_begin, 0], [physical_row, 0],
                             [BLOCK_SIZE, IDX_HEAD_DIM],
                         )
-                    # Reduce over heads with col_sum to avoid the large row_sum UB scratch.
+                    # Keep candidate columns contiguous for the Vector head reduction.
                     score_i32 = pl.matmul(query_vector, kv_i8, out_dtype=pl.INT32, b_trans=True)
                     # Each lane keeps all heads and owns a contiguous candidate-column range.
                     for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
@@ -449,7 +449,13 @@ def indexer_score_topk_forest(
                         score_fp32 = pl.cast(score_shard, target_type=pl.FP32, mode="none")
                         score_fp32 = pl.maximum(score_fp32, 0.0)
                         score_fp32 = pl.row_expand_mul(score_fp32, head_coefficient)
-                        score_sum = pl.col_sum(score_fp32)
+                        # Pair the 64 heads in six stages, keeping partial sums in FP32.
+                        score_h32 = pl.add(score_fp32[0:32, :], score_fp32[32:64, :])
+                        score_h16 = pl.add(score_h32[0:16, :], score_h32[16:32, :])
+                        score_h8 = pl.add(score_h16[0:8, :], score_h16[8:16, :])
+                        score_h4 = pl.add(score_h8[0:4, :], score_h8[4:8, :])
+                        score_h2 = pl.add(score_h4[0:2, :], score_h4[2:4, :])
+                        score_sum = pl.add(score_h2[0:1, :], score_h2[1:2, :])
                         score_row = pl.reshape(score_sum, [1, SCORE_LANE_ROWS])
                         score_row = pl.mul(score_row, kv_scale)
                         score_row_id = single_leaf * query + (1 - single_leaf) * (worker * 2 + aiv_id)
