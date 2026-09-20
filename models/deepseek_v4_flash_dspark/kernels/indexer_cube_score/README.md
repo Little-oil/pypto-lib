@@ -7,35 +7,56 @@ original score gate with compensated FP16 operands and FP32 accumulation.
 ## Measured result
 
 TP=1, runtime B=16, eight queries per request, all 16 start positions 131072.
-Both implementations use the same frozen original inputs and stock comparators.
-Measurements used baseline `f3167ecbf8838ecff0e169ee8d854baafaa0236c`
-on 2026-09-17, before rebasing this change onto newer upstream preprocessing.
-They are not a new performance comparison against the rebased main branch.
-Unprofiled device timings use five warmups and 100 measured rounds:
+The fresh 2026-09-19 comparison uses exact main commit
+`eacafcfd77187e8cb9fc5d3ae03dfec844f4d78d` as the Vector baseline and PR
+implementation `af71111a85bf258581bad87a87f73fde2a402642` on the same device 0.
+Both implementations replay the same frozen inputs and stock comparators.
+Profiling is disabled for complete-operation timings below.
 
-| Complete operation | Original median (us) | Compensated median (us) | Reduction |
+Indexer uses A-B-B-A order, five warmups and 100 timed rounds per session,
+for 200 samples per implementation. CSA first uses the same protocol,
+then a separate five-warmup, 1000-round A/B confirmation because the initial
+baseline session medians cross between two timing modes. All samples are
+retained; CSA rows below report the 1000-round confirmation.
+
+| Operation and metric | Baseline (us) | Compensated (us) | Reduction |
 |---|---:|---:|---:|
-| Indexer | 1533.6705 | 1377.4795 | 10.18% |
-| CSA | 2198.3500 | 2021.4905 | 8.05% |
+| Indexer median, 200 samples each | 1520.12 | 1358.84 | 10.61% |
+| Indexer mean, 200 samples each | 1530.01 | 1363.63 | 10.87% |
+| CSA mean, 1000 samples each | 2639.10 | 2401.31 | 9.01% |
+| CSA median, 1000 samples each | 2167.30 | 2016.21 | 6.97% |
+| CSA p95, nearest rank | 3320.78 | 3088.62 | 6.99% |
+
+CSA has a bimodal distribution: 446/1000 baseline and 380/1000 compensated
+samples exceed 2800 us. The initial 100-round baseline session medians were
+2170.11 and 3148.52 us, while their means were 2675.17 and 2718.40 us.
+The initial A-B-B-A pooled means were 2696.78 -> 2384.52 us. The confirmation
+supports an observed mean reduction; the median alone is sensitive to the
+fraction in each mode and is not a stable standalone speedup estimate.
+This measurement does not identify the cause of the two modes.
 
 A separate same-device, standalone Indexer L4 capture measured
-`indexer_score_topk_leaf` at **1381.88 -> 1176.90 us (-14.83%)**.
+`indexer_score_topk_leaf` at **1354.04 -> 1185.56 us (-12.44%)**.
 This is one task-span observation per implementation, including on-core
-waits and start skew; it is not a 100-round median or pure Cube compute time.
-The full-CSA mean was 2396.99187 -> 2084.97455 us; medians above are the
-primary latency metric.
+waits and start skew; it is not a benchmark median or pure Cube compute time.
+The coefficient preparation task spans 15.50 us in the compensated capture.
 
 The measured toolchain was PyPTO `2f892f96564d`, runtime `097735888e6d`,
 PTOAS 0.61, PTO ISA `03e45c4bda48`, and CANN 9.0.0 on A2/A3.
+Each fresh process begins with the frozen fixture. The standard benchmark
+repeats the same fixed positions without restoring tensors each round;
+metadata checks confirm disjoint historical-state reads and current writes.
+This is a repeated fixed-step measurement, not consecutive decode positions.
 
-The 65,536 selected Indexer scores have zero outliers against the actual
-original Vector outputs. Selected sets match the Torch golden; comparison
-with the actual Vector implementation retains one pre-existing boundary
-selection difference. The stock index comparator passes. The complete CSA
-output is bitwise identical to the original device output (2,097,152 FP32
-values). Existing B=2 mixed-start, B=1, and B=16 shorter-context fixtures also
-pass unchanged gates. These measurements correspond to the retained v8r
-kernel; the kernel arithmetic is unchanged by the selector rename and style cleanup.
+All fresh stock precision gates pass. The 65,536 ranked Indexer scores have
+zero outliers against the actual current Vector outputs, with maximum absolute
+difference 2.2888184e-5. The compensated selected sets match the Torch golden;
+comparison with Vector has one boundary selection difference at query 80
+(Vector selects 32712, Cube selects 28162). The original index comparator
+passes. Complete CSA output is bitwise identical to Vector across all
+2,097,152 FP32 values, and both implementations repeat consistently.
+The committed validation record preserves these fresh results and the older
+2026-09-17 measurements under a separate historical entry.
 
 The actual maximum C2V improvement is a payload reduction, not a proportional
 latency claim. For each 256-candidate tile, the original sends 64*256 INT32

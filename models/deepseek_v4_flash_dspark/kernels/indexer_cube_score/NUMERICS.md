@@ -170,9 +170,10 @@ exact operands, establish arbitrary-input or bitwise score equivalence.
 
 ## Measured validation of the retained implementation
 
-The retained six-GEMV implementation (validation snapshot `v8r`) passed the
-unchanged device precision checks for `TP=1`, runtime `B=16`, eight query
-positions per request, and every start position equal to 131072. The original
+The original 2026-09-17 validation of the retained six-GEMV implementation
+(snapshot `v8r`) passed the unchanged device precision checks for `TP=1`,
+runtime `B=16`, eight query positions per request, and every start position
+equal to 131072. The original
 compile-time capacity remains 64 requests; the fixture has 128 active queries.
 
 | Device check | Observed result |
@@ -183,6 +184,19 @@ compile-time capacity remains 64 requests; the fixture has 128 active queries.
 | Actual INT8 boundary dots `-2080768` and `2097152` | Passed; negative score exactly zero, positive score equals the original-expression golden |
 | Dedicated signed-cancellation probe | Passed its separate one-score tolerance |
 | Full target CSA output vs captured actual Vector output | All 2,097,152 elements bitwise equal |
+
+The fresh 2026-09-19 current-main comparison (`eacafcf` versus `af71111`)
+also passes the original Indexer and CSA gates. All four A-B-B-A cross-pairs
+have zero score outliers against Vector, with maximum absolute difference
+2.2888184e-5. Strict selected-set equality has one boundary difference:
+query 80 selects candidate 32712 on Vector and 28162 on Cube. Both selected
+boundary scores are 22.83275604248047; the frozen Torch golden selects 28162,
+and all compensated query sets match that golden. This does not prove that
+both candidates have equal scores within either implementation. The 65,535
+common selected IDs also have zero score outliers. Complete CSA outputs
+remain bitwise identical across all 2,097,152 elements, and repeated runs of
+each implementation are bitwise stable. These fresh device checks are
+separate from the historical fixed-ID CPU study below.
 
 The boundary smoke uses a query of all `-128` components and keys of all `127`
 and all `-128` components, respectively. It reaches the real positive INT8 dot
