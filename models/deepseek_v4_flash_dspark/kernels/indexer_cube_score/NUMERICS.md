@@ -170,6 +170,18 @@ exact operands, establish arbitrary-input or bitwise score equivalence.
 
 ## Measured validation of the retained implementation
 
+The rebase comparison against main `d4b05f9` validates the Cube source at
+`92c3e39` with unchanged thresholds. All eight A-B-B-A runs pass. Across all
+four Vector/Cube cross-pairs, the 128 Top-512 sets are identical; 80 returned
+index positions differ only in ordering. Ranked scores and all 65,536 scores
+matched by candidate ID have zero outliers, with maximum absolute difference
+3.0517578125e-5. Complete CSA outputs are bitwise equal across 2,097,152
+elements. Repeated runs within each implementation are also bitwise stable.
+This new-baseline validation supersedes the older boundary-selection
+observation below; it does not imply arbitrary-input equivalence or a
+performance benefit. See [README.md](README.md) for the latency regression
+against the new Vector implementation.
+
 The original 2026-09-17 validation of the retained six-GEMV implementation
 (snapshot `v8r`) passed the unchanged device precision checks for `TP=1`,
 runtime `B=16`, eight query positions per request, and every start position
@@ -185,7 +197,7 @@ compile-time capacity remains 64 requests; the fixture has 128 active queries.
 | Dedicated signed-cancellation probe | Passed its separate one-score tolerance |
 | Full target CSA output vs captured actual Vector output | All 2,097,152 elements bitwise equal |
 
-The fresh 2026-09-19 current-main comparison (`eacafcf` versus `af71111`)
+The earlier 2026-09-19 comparison (`eacafcf` versus `af71111`)
 also passes the original Indexer and CSA gates. All four A-B-B-A cross-pairs
 have zero score outliers against Vector, with maximum absolute difference
 2.2888184e-5. Strict selected-set equality has one boundary difference:

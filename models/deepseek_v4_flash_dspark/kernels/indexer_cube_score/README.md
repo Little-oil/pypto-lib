@@ -6,40 +6,45 @@ original score gate with compensated FP16 operands and FP32 accumulation.
 
 ## Measured result
 
+The current Cube path is slower than the new Vector baseline after
+[PR #1255](https://github.com/hw-native-sys/pypto-lib/pull/1255). The GM
+payload reduction does not produce a latency improvement against this main
+revision. The compensated path remains opt-in; Vector remains the default.
+
 TP=1, runtime B=16, eight queries per request, all 16 start positions 131072.
-The fresh 2026-09-19 comparison uses exact main commit
-`eacafcfd77187e8cb9fc5d3ae03dfec844f4d78d` as the Vector baseline and PR
-implementation `af71111a85bf258581bad87a87f73fde2a402642` on the same device 0.
-Both implementations replay the same frozen inputs and stock comparators.
-Profiling is disabled for complete-operation timings below.
+The 2026-09-19 rebase comparison uses exact main commit
+`d4b05f91c097e0318c50bae522eb51e1aa231ff4` as the Vector baseline and the
+rebased Cube implementation at `92c3e39` on the same device 8. All four
+Indexer/CSA implementations were freshly compiled. Both paths replay the
+same frozen inputs and use the original comparators. Main's 384-candidate
+Vector tile and column reduction are preserved; the Cube pipe is separately
+sized for its fixed 256-candidate tile.
 
-Indexer uses A-B-B-A order, five warmups and 100 timed rounds per session,
-for 200 samples per implementation. CSA first uses the same protocol,
-then a separate five-warmup, 1000-round A/B confirmation because the initial
-baseline session medians cross between two timing modes. All samples are
-retained; CSA rows below report the 1000-round confirmation.
+Each operation uses A-B-B-A order, five warmups and 100 timed rounds per
+session, for 200 samples per implementation. Profiling is disabled for all
+complete-operation timings. Positive changes below mean longer latency.
 
-| Operation and metric | Baseline (us) | Compensated (us) | Reduction |
+| Operation and metric | Main Vector (us) | Compensated (us) | Change |
 |---|---:|---:|---:|
-| Indexer median, 200 samples each | 1520.12 | 1358.84 | 10.61% |
-| Indexer mean, 200 samples each | 1530.01 | 1363.63 | 10.87% |
-| CSA mean, 1000 samples each | 2639.10 | 2401.31 | 9.01% |
-| CSA median, 1000 samples each | 2167.30 | 2016.21 | 6.97% |
-| CSA p95, nearest rank | 3320.78 | 3088.62 | 6.99% |
+| Indexer median | 1268.21 | 1357.32 | +7.03% |
+| Indexer mean | 1271.24 | 1372.26 | +7.95% |
+| CSA mean | 2301.77 | 2383.87 | +3.57% |
+| CSA median | 1918.75 | 2011.07 | +4.81% |
+| CSA p95, nearest rank | 2805.46 | 3094.28 | +10.29% |
 
-CSA has a bimodal distribution: 446/1000 baseline and 380/1000 compensated
-samples exceed 2800 us. The initial 100-round baseline session medians were
-2170.11 and 3148.52 us, while their means were 2675.17 and 2718.40 us.
-The initial A-B-B-A pooled means were 2696.78 -> 2384.52 us. The confirmation
-supports an observed mean reduction; the median alone is sensitive to the
-fraction in each mode and is not a stable standalone speedup estimate.
-This measurement does not identify the cause of the two modes.
+CSA remains bimodal: 95/200 Vector samples and 73/200 Cube samples exceed
+2500 us. Individual Vector session medians are 2685.18 and 1911.16 us;
+Cube session medians are 2009.77 and 2011.07 us. All samples are retained,
+and the median alone is sensitive to the mode mix. Vector session means
+are 2332.79 and 2270.75 us, both below Cube's 2387.75 and 2379.98 us.
+PR #1255's reported 1957.61 us median used device 0 and a different frozen
+fixture; it is not the measured baseline for this paired device-8 run.
 
 A separate same-device, standalone Indexer L4 capture measured
-`indexer_score_topk_leaf` at **1354.04 -> 1185.56 us (-12.44%)**.
+`indexer_score_topk_leaf` at **1101.20 -> 1183.46 us (+7.47%)**.
 This is one task-span observation per implementation, including on-core
 waits and start skew; it is not a benchmark median or pure Cube compute time.
-The coefficient preparation task spans 15.50 us in the compensated capture.
+The additional coefficient preparation task spans 11.36 us.
 
 The measured toolchain was PyPTO `2f892f96564d`, runtime `097735888e6d`,
 PTOAS 0.61, PTO ISA `03e45c4bda48`, and CANN 9.0.0 on A2/A3.
@@ -48,22 +53,24 @@ repeats the same fixed positions without restoring tensors each round;
 metadata checks confirm disjoint historical-state reads and current writes.
 This is a repeated fixed-step measurement, not consecutive decode positions.
 
-All fresh stock precision gates pass. The 65,536 ranked Indexer scores have
-zero outliers against the actual current Vector outputs, with maximum absolute
-difference 2.2888184e-5. The compensated selected sets match the Torch golden;
-comparison with Vector has one boundary selection difference at query 80
-(Vector selects 32712, Cube selects 28162). The original index comparator
-passes. Complete CSA output is bitwise identical to Vector across all
-2,097,152 FP32 values, and both implementations repeat consistently.
-The committed validation record preserves these fresh results and the older
-2026-09-17 measurements under a separate historical entry.
+All eight runs pass the stock precision gates. All 128 Top-512 sets match between
+Vector and Cube; 80 returned index positions differ only in ordering within
+those sets. Ranked scores and the 65,536 scores matched by candidate ID have
+zero outliers, with maximum absolute difference 3.0517578125e-5. Complete CSA
+output is bitwise identical across all 2,097,152 FP32 values. Both
+implementations repeat consistently. The committed validation record keeps
+the older comparisons against `eacafcf` and `f3167ec` as historical evidence;
+their speedup claims do not apply to the new main baseline.
 
-The actual maximum C2V improvement is a payload reduction, not a proportional
-latency claim. For each 256-candidate tile, the original sends 64*256 INT32
-values (64 KiB); this implementation sends 256 FP32 values (1 KiB), exactly
-1/64. The target issues 16,464 such tiles, including padding: 1029 MiB versus
-16.078125 MiB in each direction. This is logical GM payload, not measured
-physical HBM traffic. Precision compensation, Key loading, local transfers,
+The C2V representation uses one FP32 value instead of 64 INT32 values per
+candidate: 1/64 of the original bytes per candidate. The current Vector
+baseline uses 384-candidate tiles (96 KiB each); Cube uses 256-candidate tiles
+(1 KiB each). With each path's own tail padding, the target issues 11,344
+Vector tiles versus 16,464 Cube tiles, or 1063.5 MiB versus 16.078125 MiB in
+each direction. The total padded-byte ratio is therefore approximately
+1.5118%, rather than exactly 1/64. This is logical GM payload calculated
+from the tile shapes, not measured physical HBM traffic or a proportional
+latency claim. Precision compensation, Key loading, local transfers,
 synchronization, and TopK still take time.
 
 ## Execution
