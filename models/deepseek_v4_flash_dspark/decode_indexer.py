@@ -100,6 +100,7 @@ TOPK_SCORE_WORKERS = 24  # Top-K score workers
 SCORE_TILE = 384
 SCORE_LANE_ROWS = SCORE_TILE // 2
 SCORE_ARENA_ROWS = max(T_PAD, TOPK_SCORE_WORKERS * 2)
+CUBE_SCORE_TILE = 256  # Matches the fixed score tile in score_fused.cpp.
 
 # Opt-in A2/A3 Cube contraction with compensated operands. The original path
 # remains available for coefficient ranges or devices outside the validated contract.
@@ -563,7 +564,7 @@ def indexer_score_topk_forest_cube(
             pl.store(pl.reinterpret_view(bias, pl.FP32), [0, 5120], math_constants)
 
     pair_arena = pl.create_tensor([TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32)
-    pipe_workspace = pl.create_tensor([TOPK_SCORE_WORKERS, 8 * SCORE_TILE], dtype=pl.FP32)
+    pipe_workspace = pl.create_tensor([TOPK_SCORE_WORKERS, 8 * CUBE_SCORE_TILE], dtype=pl.FP32)
     with pl.spmd(TOPK_SCORE_WORKERS, name_hint="indexer_score_topk_leaf", deps=[coeff_tid, cache_write_tid], allow_early_resolve=True) as score_tid:
         pair_arena = indexer_cube_score_topk(
             pair_arena, pipe_workspace,
