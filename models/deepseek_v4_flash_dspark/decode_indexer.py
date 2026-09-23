@@ -95,10 +95,11 @@ TOPK_ROWS_PER_QUERY = TOPK_MAX_LEAVES * 2
 TOPK_QUERY_WORKERS = 48  # Top-K query-merge workers
 TOPK_ARENA_ROWS = T_PAD * TOPK_ROWS_PER_QUERY
 TOPK_SCORE_WORKERS = 24  # Top-K score workers
-SCORE_TILE = 512
+SCORE_TILE = 384
 SCORE_LANE_ROWS = SCORE_TILE // 2
 SCORE_ARENA_ROWS = max(T_PAD, TOPK_SCORE_WORKERS * 2)
 SCORE_FIXPIPE_SCALE = 1.0 / 1024
+CUBE_SCORE_MIN_CANDIDATES = TOPK_CANDIDATES_PER_LEAF + 1
 
 
 @pl.jit.inline
@@ -390,42 +391,56 @@ def indexer_score_topk_forest(
             for coefficient_query in pl.range(
                 coefficient_lane, query_count, TOPK_SCORE_WORKERS * 2
             ):
-                coefficient_head_begin = coefficient_query * IDX_N_HEADS
-                query_scale_col = pl.tile.load(
-                    qr_hadamard_scale_dq,
-                    [coefficient_head_begin, 0],
-                    [IDX_N_HEADS, 1],
-                    target_memory=pl.Mem.Vec,
+                coefficient_position = pl.read(position_ids, [coefficient_query])
+                coefficient_cache_len = (
+                    pl.read(kv_seq_lens, [coefficient_query // S]) // COMPRESS_RATIO
                 )
-                query_scale = pl.tile.reshape(query_scale_col, [1, IDX_N_HEADS])
-                query_weight = pl.tile.load(
-                    weights,
-                    [coefficient_query, 0],
-                    [1, IDX_N_HEADS],
-                    target_memory=pl.Mem.Vec,
-                )
-                head_coefficient = pl.tile.cast(
-                    pl.tile.mul(query_scale, query_weight),
-                    target_type=pl.FP16,
-                    mode="rint",
-                )
-                coefficient_box = pl.tile.add(
-                    pl.tile.full(
-                        [16, IDX_N_HEADS], dtype=pl.FP16, value=0.0
+                coefficient_visible_count = pl.max(
+                    pl.min(
+                        coefficient_cache_len,
+                        (coefficient_position + 1) // COMPRESS_RATIO,
                     ),
-                    head_coefficient,
+                    0,
                 )
-                pl.tile.store(
-                    coefficient_box,
-                    [coefficient_query, 0, 0],
-                    score_coefficient_fp16,
-                )
+                if coefficient_visible_count >= CUBE_SCORE_MIN_CANDIDATES:
+                    coefficient_head_begin = coefficient_query * IDX_N_HEADS
+                    query_scale_col = pl.tile.load(
+                        qr_hadamard_scale_dq,
+                        [coefficient_head_begin, 0],
+                        [IDX_N_HEADS, 1],
+                        target_memory=pl.Mem.Vec,
+                    )
+                    query_scale = pl.tile.reshape(
+                        query_scale_col, [1, IDX_N_HEADS]
+                    )
+                    query_weight = pl.tile.load(
+                        weights,
+                        [coefficient_query, 0],
+                        [1, IDX_N_HEADS],
+                        target_memory=pl.Mem.Vec,
+                    )
+                    head_coefficient = pl.tile.cast(
+                        pl.tile.mul(query_scale, query_weight),
+                        target_type=pl.FP16,
+                        mode="rint",
+                    )
+                    coefficient_box = pl.tile.add(
+                        pl.tile.full(
+                            [16, IDX_N_HEADS], dtype=pl.FP16, value=0.0
+                        ),
+                        head_coefficient,
+                    )
+                    pl.tile.store(
+                        coefficient_box,
+                        [coefficient_query, 0, 0],
+                        score_coefficient_fp16,
+                    )
     with pl.spmd(
         TOPK_SCORE_WORKERS,
         name_hint="indexer_score_topk_leaf",
         deps=[coefficient_tid, cache_write_tid],
         allow_early_resolve=True,
-        optimizations=[pl.cross_core_slot(slot_num=2)],
+        optimizations=[pl.cross_core_slot(slot_num=1)],
     ) as score_tid:
         worker = pl.tile.get_block_idx()
         max_cache_len = 0
@@ -452,110 +467,319 @@ def indexer_score_topk_forest(
                 )
                 lane_stride = single_leaf * SCORE_LANE_ROWS + (1 - single_leaf) * lane_span
                 query_head_begin = query * IDX_N_HEADS
-                # Both left operands are invariant across every candidate tile
-                # in this leaf.  Keep them resident in L0A instead of issuing
-                # the same GM/L1/L0A transfers for every score tile.
-                query_vector = pl.tile.load(
-                    qr_hadamard_i8,
-                    [query_head_begin, 0],
-                    [IDX_N_HEADS, IDX_HEAD_DIM],
-                    target_memory=pl.Mem.Mat,
-                )
-                query_vector_left = pl.tile.move(
-                    query_vector, target_memory=pl.Mem.Left,
-                )
-                coefficient_nz_mat = pl.tile.load(
-                    score_coefficient_fp16_t,
-                    [query, 0, 0],
-                    [1, IDX_N_HEADS, 16],
-                    target_memory=pl.Mem.Mat,
-                )
-                coefficient = pl.tile.reshape(
-                    coefficient_nz_mat, [IDX_N_HEADS, 16]
-                )
-                coefficient_left = pl.tile.move(
-                    pl.tile.transpose_view(coefficient),
-                    target_memory=pl.Mem.Left,
-                )
-                for score_begin in pl.pipeline(0, lane_span, SCORE_LANE_ROWS, stage=2):
-                    read_begin = score_begin * (1 + single_leaf)
-                    kv_i8 = pl.tile.create(
-                        [SCORE_TILE, IDX_HEAD_DIM], pl.INT8,
+                # The INT8 QK matmul is shared by both score paths. Keep Q in
+                # L0A across candidate tiles; only long contexts prepare the
+                # FP16 coefficient operand for the second Cube matmul.
+                use_cube_score = visible_count >= CUBE_SCORE_MIN_CANDIDATES
+                if use_cube_score:
+                    cube_query = pl.tile.load(
+                        qr_hadamard_i8,
+                        [query_head_begin, 0],
+                        [IDX_N_HEADS, IDX_HEAD_DIM],
                         target_memory=pl.Mem.Mat,
                     )
-                    for page in pl.unroll(SCORE_TILE // BLOCK_SIZE):
-                        page_begin = page * BLOCK_SIZE
-                        lane_page = (page_begin // SCORE_LANE_ROWS) * lane_stride + page_begin % SCORE_LANE_ROWS
-                        safe_page_begin = pl.min(read_begin + lane_page, ((valid_count - 1) // BLOCK_SIZE) * BLOCK_SIZE)
-                        logical_page = (logical_begin + safe_page_begin) // BLOCK_SIZE
-                        physical_block = pl.cast(pl.read(idx_block_table_flat, [batch_idx * IDX_MAX_BLOCKS + logical_page]), pl.INDEX)
-                        physical_row = physical_block * BLOCK_SIZE
-                        kv_i8 = pl.gather_row(
-                            kv_i8, kv_cache_i8_flat, [page_begin, 0], [physical_row, 0],
-                            [BLOCK_SIZE, IDX_HEAD_DIM],
-                        )
-                    # QK stays on Cube. FIXPIPE performs INT32 -> FP16,
-                    # fixed dequantization, and ReLU while storing the tile.
-                    score_i32 = pl.tile.matmul(
-                        query_vector_left,
-                        pl.tile.move(pl.tile.transpose_view(kv_i8), target_memory=pl.Mem.Right),
+                    cube_query_left = pl.tile.move(
+                        cube_query, target_memory=pl.Mem.Left,
                     )
-                    # Keep the large intermediate on chip. FIXPIPE drains the
-                    # INT32 accumulator directly into an FP16 L1 tile while
-                    # applying the fixed scale and ReLU; the following matmul
-                    # consumes that tile through L0B without a GM round trip.
-                    score_relu = pl.tile.create(
-                        [IDX_N_HEADS, SCORE_TILE],
-                        pl.FP16,
+                    coefficient_nz_mat = pl.tile.load(
+                        score_coefficient_fp16_t,
+                        [query, 0, 0],
+                        [1, IDX_N_HEADS, 16],
                         target_memory=pl.Mem.Mat,
                     )
-                    score_relu = pl.tile.assemble(
-                        score_relu,
-                        score_i32,
-                        [0, 0],
-                        pre_quant=SCORE_FIXPIPE_SCALE,
-                        pre_relu=True,
+                    coefficient = pl.tile.reshape(
+                        coefficient_nz_mat, [IDX_N_HEADS, 16]
                     )
-                    # The second Cube matmul replaces candidate-wise broadcast,
-                    # multiply, and head reduction on Vector.
-                    score_acc = pl.matmul(
-                        coefficient_left,
-                        score_relu,
-                        out_dtype=pl.FP32,
+                    coefficient_left = pl.tile.move(
+                        pl.tile.transpose_view(coefficient),
+                        target_memory=pl.Mem.Left,
                     )
-                    # Each lane keeps all heads and owns a contiguous candidate-column range.
-                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
-                        lane_begin = aiv_id * lane_stride
-                        lane_valid_rows = pl.max(pl.min(valid_count - read_begin - lane_begin, SCORE_LANE_ROWS), 0)
-                        kv_scale = pl.tile.create(
-                            [1, SCORE_LANE_ROWS],
-                            pl.FP32,
-                            target_memory=pl.Mem.Vec,
+                    for cube_score_begin in pl.pipeline(
+                        0, lane_span, SCORE_LANE_ROWS, stage=2
+                    ):
+                        cube_read_begin = cube_score_begin * (1 + single_leaf)
+                        cube_kv_i8 = pl.tile.create(
+                            [SCORE_TILE, IDX_HEAD_DIM],
+                            pl.INT8,
+                            target_memory=pl.Mem.Mat,
                         )
-                        for scale_page in pl.unroll(SCORE_TILE // (2 * BLOCK_SIZE)):
-                            scale_page_begin = scale_page * BLOCK_SIZE
-                            safe_scale_begin = pl.min(
-                                read_begin + lane_begin + scale_page_begin,
+                        for cube_page in pl.unroll(SCORE_TILE // BLOCK_SIZE):
+                            cube_page_begin = cube_page * BLOCK_SIZE
+                            cube_lane_page = (
+                                cube_page_begin // SCORE_LANE_ROWS
+                            ) * lane_stride + cube_page_begin % SCORE_LANE_ROWS
+                            cube_safe_page_begin = pl.min(
+                                cube_read_begin + cube_lane_page,
                                 ((valid_count - 1) // BLOCK_SIZE) * BLOCK_SIZE,
                             )
-                            scale_logical_page = (logical_begin + safe_scale_begin) // BLOCK_SIZE
-                            scale_block = pl.cast(pl.read(
-                                idx_block_table_flat, [batch_idx * IDX_MAX_BLOCKS + scale_logical_page]
-                            ), pl.INDEX)
-                            scale_physical_row = scale_block * BLOCK_SIZE
-                            kv_scale = pl.gather_row(
-                                kv_scale, kv_scale_row, [0, scale_page_begin],
-                                [0, scale_physical_row], [1, BLOCK_SIZE],
+                            cube_logical_page = (
+                                logical_begin + cube_safe_page_begin
+                            ) // BLOCK_SIZE
+                            cube_physical_block = pl.cast(
+                                pl.read(
+                                    idx_block_table_flat,
+                                    [batch_idx * IDX_MAX_BLOCKS + cube_logical_page],
+                                ),
+                                pl.INDEX,
                             )
-                        score_row = pl.aiv_shard(score_acc)
-                        score_row = pl.mul(score_row, kv_scale)
-                        score_row_id = single_leaf * query + (1 - single_leaf) * (worker * 2 + aiv_id)
-                        score_col = single_leaf * (read_begin + lane_begin) + (1 - single_leaf) * score_begin
-                        # Store only valid scores; the Top-K load pads its own tail.
-                        if lane_valid_rows > 0:
-                            score_valid = pl.set_validshape(score_row, 1, lane_valid_rows)
-                            pl.tile.store(score_valid, [score_row_id, score_col], score_arena)
-
+                            cube_kv_i8 = pl.gather_row(
+                                cube_kv_i8,
+                                kv_cache_i8_flat,
+                                [cube_page_begin, 0],
+                                [cube_physical_block * BLOCK_SIZE, 0],
+                                [BLOCK_SIZE, IDX_HEAD_DIM],
+                            )
+                        cube_score_i32 = pl.tile.matmul(
+                            cube_query_left,
+                            pl.tile.move(
+                                pl.tile.transpose_view(cube_kv_i8),
+                                target_memory=pl.Mem.Right,
+                            ),
+                        )
+                        cube_score_relu = pl.tile.create(
+                            [IDX_N_HEADS, SCORE_TILE],
+                            pl.FP16,
+                            target_memory=pl.Mem.Mat,
+                        )
+                        cube_score_relu = pl.tile.assemble(
+                            cube_score_relu,
+                            cube_score_i32,
+                            [0, 0],
+                            pre_quant=SCORE_FIXPIPE_SCALE,
+                            pre_relu=True,
+                        )
+                        cube_score_acc = pl.matmul(
+                            coefficient_left,
+                            cube_score_relu,
+                            out_dtype=pl.FP32,
+                        )
+                        for cube_aiv in pl.split_aiv(
+                            2, mode=pl.SplitMode.LEFT_RIGHT
+                        ):
+                            cube_lane_begin = cube_aiv * lane_stride
+                            cube_lane_valid = pl.max(
+                                pl.min(
+                                    valid_count
+                                    - cube_read_begin
+                                    - cube_lane_begin,
+                                    SCORE_LANE_ROWS,
+                                ),
+                                0,
+                            )
+                            cube_kv_scale = pl.tile.create(
+                                [1, SCORE_LANE_ROWS],
+                                pl.FP32,
+                                target_memory=pl.Mem.Vec,
+                            )
+                            for cube_scale_page in pl.unroll(
+                                SCORE_TILE // (2 * BLOCK_SIZE)
+                            ):
+                                cube_scale_begin = cube_scale_page * BLOCK_SIZE
+                                cube_safe_scale_begin = pl.min(
+                                    cube_read_begin
+                                    + cube_lane_begin
+                                    + cube_scale_begin,
+                                    ((valid_count - 1) // BLOCK_SIZE) * BLOCK_SIZE,
+                                )
+                                cube_scale_logical_page = (
+                                    logical_begin + cube_safe_scale_begin
+                                ) // BLOCK_SIZE
+                                cube_scale_block = pl.cast(
+                                    pl.read(
+                                        idx_block_table_flat,
+                                        [
+                                            batch_idx * IDX_MAX_BLOCKS
+                                            + cube_scale_logical_page
+                                        ],
+                                    ),
+                                    pl.INDEX,
+                                )
+                                cube_kv_scale = pl.gather_row(
+                                    cube_kv_scale,
+                                    kv_scale_row,
+                                    [0, cube_scale_begin],
+                                    [0, cube_scale_block * BLOCK_SIZE],
+                                    [1, BLOCK_SIZE],
+                                )
+                            cube_score_row = pl.mul(
+                                pl.aiv_shard(cube_score_acc), cube_kv_scale
+                            )
+                            if cube_lane_valid > 0:
+                                cube_score_valid = pl.set_validshape(
+                                    cube_score_row, 1, cube_lane_valid
+                                )
+                                cube_score_row_id = (
+                                    single_leaf * query
+                                    + (1 - single_leaf) * (worker * 2 + cube_aiv)
+                                )
+                                cube_score_col = (
+                                    single_leaf
+                                    * (cube_read_begin + cube_lane_begin)
+                                    + (1 - single_leaf) * cube_score_begin
+                                )
+                                pl.tile.store(
+                                    cube_score_valid,
+                                    [cube_score_row_id, cube_score_col],
+                                    score_arena,
+                                )
+                else:
+                    vector_query = pl.tile.load(
+                        qr_hadamard_i8,
+                        [query_head_begin, 0],
+                        [IDX_N_HEADS, IDX_HEAD_DIM],
+                        target_memory=pl.Mem.Mat,
+                    )
+                    vector_query_left = pl.tile.move(
+                        vector_query, target_memory=pl.Mem.Left,
+                    )
+                    for _vector_coeff_aiv in pl.split_aiv(
+                        2, mode=pl.SplitMode.NONE
+                    ):
+                        vector_scale_col = pl.tile.load(
+                            qr_hadamard_scale_dq,
+                            [query_head_begin, 0],
+                            [IDX_N_HEADS, 1],
+                            target_memory=pl.Mem.Vec,
+                        )
+                        vector_scale = pl.tile.reshape(
+                            vector_scale_col, [1, IDX_N_HEADS]
+                        )
+                        vector_weight = pl.tile.load(
+                            weights,
+                            [query, 0],
+                            [1, IDX_N_HEADS],
+                            target_memory=pl.Mem.Vec,
+                        )
+                        vector_coefficient = pl.tile.reshape(
+                            pl.tile.mul(vector_scale, vector_weight),
+                            [IDX_N_HEADS, 1],
+                        )
+                    for vector_score_begin in pl.pipeline(
+                        0, lane_span, SCORE_LANE_ROWS, stage=2
+                    ):
+                        vector_read_begin = vector_score_begin * (1 + single_leaf)
+                        vector_kv_i8 = pl.tile.create(
+                            [SCORE_TILE, IDX_HEAD_DIM],
+                            pl.INT8,
+                            target_memory=pl.Mem.Mat,
+                        )
+                        for vector_page in pl.unroll(SCORE_TILE // BLOCK_SIZE):
+                            vector_page_begin = vector_page * BLOCK_SIZE
+                            vector_lane_page = (
+                                vector_page_begin // SCORE_LANE_ROWS
+                            ) * lane_stride + vector_page_begin % SCORE_LANE_ROWS
+                            vector_safe_page_begin = pl.min(
+                                vector_read_begin + vector_lane_page,
+                                ((valid_count - 1) // BLOCK_SIZE) * BLOCK_SIZE,
+                            )
+                            vector_logical_page = (
+                                logical_begin + vector_safe_page_begin
+                            ) // BLOCK_SIZE
+                            vector_physical_block = pl.cast(
+                                pl.read(
+                                    idx_block_table_flat,
+                                    [batch_idx * IDX_MAX_BLOCKS + vector_logical_page],
+                                ),
+                                pl.INDEX,
+                            )
+                            vector_kv_i8 = pl.gather_row(
+                                vector_kv_i8,
+                                kv_cache_i8_flat,
+                                [vector_page_begin, 0],
+                                [vector_physical_block * BLOCK_SIZE, 0],
+                                [BLOCK_SIZE, IDX_HEAD_DIM],
+                            )
+                        vector_score_i32 = pl.tile.matmul(
+                            vector_query_left,
+                            pl.tile.move(
+                                pl.tile.transpose_view(vector_kv_i8),
+                                target_memory=pl.Mem.Right,
+                            ),
+                        )
+                        for vector_aiv in pl.split_aiv(
+                            2, mode=pl.SplitMode.LEFT_RIGHT
+                        ):
+                            vector_lane_begin = vector_aiv * lane_stride
+                            vector_lane_valid = pl.max(
+                                pl.min(
+                                    valid_count
+                                    - vector_read_begin
+                                    - vector_lane_begin,
+                                    SCORE_LANE_ROWS,
+                                ),
+                                0,
+                            )
+                            vector_kv_scale = pl.tile.create(
+                                [1, SCORE_LANE_ROWS],
+                                pl.FP32,
+                                target_memory=pl.Mem.Vec,
+                            )
+                            for vector_scale_page in pl.unroll(
+                                SCORE_TILE // (2 * BLOCK_SIZE)
+                            ):
+                                vector_scale_begin = vector_scale_page * BLOCK_SIZE
+                                vector_safe_scale_begin = pl.min(
+                                    vector_read_begin
+                                    + vector_lane_begin
+                                    + vector_scale_begin,
+                                    ((valid_count - 1) // BLOCK_SIZE) * BLOCK_SIZE,
+                                )
+                                vector_scale_logical_page = (
+                                    logical_begin + vector_safe_scale_begin
+                                ) // BLOCK_SIZE
+                                vector_scale_block = pl.cast(
+                                    pl.read(
+                                        idx_block_table_flat,
+                                        [
+                                            batch_idx * IDX_MAX_BLOCKS
+                                            + vector_scale_logical_page
+                                        ],
+                                    ),
+                                    pl.INDEX,
+                                )
+                                vector_kv_scale = pl.gather_row(
+                                    vector_kv_scale,
+                                    kv_scale_row,
+                                    [0, vector_scale_begin],
+                                    [0, vector_scale_block * BLOCK_SIZE],
+                                    [1, BLOCK_SIZE],
+                                )
+                            vector_score_fp32 = pl.cast(
+                                pl.aiv_shard(vector_score_i32),
+                                target_type=pl.FP32,
+                                mode="none",
+                            )
+                            vector_score_fp32 = pl.maximum(
+                                vector_score_fp32, 0.0
+                            )
+                            vector_score_fp32 = pl.row_expand_mul(
+                                vector_score_fp32, vector_coefficient
+                            )
+                            vector_score_sum = pl.col_sum(vector_score_fp32)
+                            vector_score_row = pl.mul(
+                                pl.tile.reshape(
+                                    vector_score_sum, [1, SCORE_LANE_ROWS]
+                                ),
+                                vector_kv_scale,
+                            )
+                            if vector_lane_valid > 0:
+                                vector_score_valid = pl.set_validshape(
+                                    vector_score_row, 1, vector_lane_valid
+                                )
+                                vector_score_row_id = (
+                                    single_leaf * query
+                                    + (1 - single_leaf) * (worker * 2 + vector_aiv)
+                                )
+                                vector_score_col = (
+                                    single_leaf
+                                    * (vector_read_begin + vector_lane_begin)
+                                    + (1 - single_leaf) * vector_score_begin
+                                )
+                                pl.tile.store(
+                                    vector_score_valid,
+                                    [vector_score_row_id, vector_score_col],
+                                    score_arena,
+                                )
                 if single_leaf == 0:
                     for sort_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                         half_begin = logical_begin + sort_lane * lane_span
