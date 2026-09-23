@@ -95,8 +95,10 @@ TOPK_ROWS_PER_QUERY = TOPK_MAX_LEAVES * 2
 TOPK_QUERY_WORKERS = 48  # Top-K query-merge workers
 TOPK_ARENA_ROWS = T_PAD * TOPK_ROWS_PER_QUERY
 TOPK_SCORE_WORKERS = 24  # Top-K score workers
-SCORE_TILE = 384
-SCORE_LANE_ROWS = SCORE_TILE // 2
+VECTOR_SCORE_TILE = 384
+VECTOR_SCORE_LANE_ROWS = VECTOR_SCORE_TILE // 2
+CUBE_SCORE_TILE = 512
+CUBE_SCORE_LANE_ROWS = CUBE_SCORE_TILE // 2
 SCORE_ARENA_ROWS = max(T_PAD, TOPK_SCORE_WORKERS * 2)
 SCORE_FIXPIPE_SCALE = 1.0 / 1024
 CUBE_SCORE_MIN_CANDIDATES = TOPK_CANDIDATES_PER_LEAF + 1
@@ -366,7 +368,10 @@ def indexer_score_topk_forest(
         [TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32
     )
     # The whole batch uses query rows for one leaf, or private lane rows for multiple leaves.
-    score_arena = pl.create_tensor(
+    cube_score_arena = pl.create_tensor(
+        [SCORE_ARENA_ROWS, TOPK_CANDIDATES_PER_LEAF], dtype=pl.FP32
+    )
+    vector_score_arena = pl.create_tensor(
         [SCORE_ARENA_ROWS, TOPK_CANDIDATES_PER_LEAF], dtype=pl.FP32
     )
     score_coefficient_fp16 = pl.create_tensor(
@@ -437,11 +442,11 @@ def indexer_score_topk_forest(
                     )
     with pl.spmd(
         TOPK_SCORE_WORKERS,
-        name_hint="indexer_score_topk_leaf",
+        name_hint="indexer_score_topk_leaf_cube",
         deps=[coefficient_tid, cache_write_tid],
         allow_early_resolve=True,
-        optimizations=[pl.cross_core_slot(slot_num=1)],
-    ) as score_tid:
+        optimizations=[pl.cross_core_slot(slot_num=2)],
+    ) as cube_score_tid:
         worker = pl.tile.get_block_idx()
         max_cache_len = 0
         for batch in pl.range(query_count // S):
@@ -458,20 +463,19 @@ def indexer_score_topk_forest(
             cache_bound = pl.min(cache_len, (position + 1) // COMPRESS_RATIO)
             visible_count = pl.max(pl.min(cache_bound, TOPK_MAX_CANDIDATES), 0)
             logical_begin = leaf * TOPK_CANDIDATES_PER_LEAF
-            if logical_begin < visible_count:
-                valid_count = pl.min(TOPK_CANDIDATES_PER_LEAF, visible_count - logical_begin)
-                # Each half-leaf must fit the 4096-candidate sort path.
-                lane_span = pl.min(
-                    ((valid_count + SCORE_TILE - 1) // SCORE_TILE) * SCORE_LANE_ROWS,
-                    TOPK_CANDIDATES_PER_LEAF // 2,
-                )
-                lane_stride = single_leaf * SCORE_LANE_ROWS + (1 - single_leaf) * lane_span
-                query_head_begin = query * IDX_N_HEADS
-                # The INT8 QK matmul is shared by both score paths. Keep Q in
-                # L0A across candidate tiles; only long contexts prepare the
-                # FP16 coefficient operand for the second Cube matmul.
-                use_cube_score = visible_count >= CUBE_SCORE_MIN_CANDIDATES
-                if use_cube_score:
+            if visible_count >= CUBE_SCORE_MIN_CANDIDATES:
+                if logical_begin < visible_count:
+                    valid_count = pl.min(TOPK_CANDIDATES_PER_LEAF, visible_count - logical_begin)
+                    # Each half-leaf must fit the 4096-candidate sort path.
+                    lane_span = pl.min(
+                        ((valid_count + CUBE_SCORE_TILE - 1) // CUBE_SCORE_TILE) * CUBE_SCORE_LANE_ROWS,
+                        TOPK_CANDIDATES_PER_LEAF // 2,
+                    )
+                    lane_stride = single_leaf * CUBE_SCORE_LANE_ROWS + (1 - single_leaf) * lane_span
+                    query_head_begin = query * IDX_N_HEADS
+                    # The INT8 QK matmul is shared by both score paths. Keep Q in
+                    # L0A across candidate tiles; only long contexts prepare the
+                    # FP16 coefficient operand for the second Cube matmul.
                     cube_query = pl.tile.load(
                         qr_hadamard_i8,
                         [query_head_begin, 0],
@@ -495,19 +499,19 @@ def indexer_score_topk_forest(
                         target_memory=pl.Mem.Left,
                     )
                     for cube_score_begin in pl.pipeline(
-                        0, lane_span, SCORE_LANE_ROWS, stage=2
+                        0, lane_span, CUBE_SCORE_LANE_ROWS, stage=2
                     ):
                         cube_read_begin = cube_score_begin * (1 + single_leaf)
                         cube_kv_i8 = pl.tile.create(
-                            [SCORE_TILE, IDX_HEAD_DIM],
+                            [CUBE_SCORE_TILE, IDX_HEAD_DIM],
                             pl.INT8,
                             target_memory=pl.Mem.Mat,
                         )
-                        for cube_page in pl.unroll(SCORE_TILE // BLOCK_SIZE):
+                        for cube_page in pl.unroll(CUBE_SCORE_TILE // BLOCK_SIZE):
                             cube_page_begin = cube_page * BLOCK_SIZE
                             cube_lane_page = (
-                                cube_page_begin // SCORE_LANE_ROWS
-                            ) * lane_stride + cube_page_begin % SCORE_LANE_ROWS
+                                cube_page_begin // CUBE_SCORE_LANE_ROWS
+                            ) * lane_stride + cube_page_begin % CUBE_SCORE_LANE_ROWS
                             cube_safe_page_begin = pl.min(
                                 cube_read_begin + cube_lane_page,
                                 ((valid_count - 1) // BLOCK_SIZE) * BLOCK_SIZE,
@@ -537,7 +541,7 @@ def indexer_score_topk_forest(
                             ),
                         )
                         cube_score_relu = pl.tile.create(
-                            [IDX_N_HEADS, SCORE_TILE],
+                            [IDX_N_HEADS, CUBE_SCORE_TILE],
                             pl.FP16,
                             target_memory=pl.Mem.Mat,
                         )
@@ -562,17 +566,17 @@ def indexer_score_topk_forest(
                                     valid_count
                                     - cube_read_begin
                                     - cube_lane_begin,
-                                    SCORE_LANE_ROWS,
+                                    CUBE_SCORE_LANE_ROWS,
                                 ),
                                 0,
                             )
                             cube_kv_scale = pl.tile.create(
-                                [1, SCORE_LANE_ROWS],
+                                [1, CUBE_SCORE_LANE_ROWS],
                                 pl.FP32,
                                 target_memory=pl.Mem.Vec,
                             )
                             for cube_scale_page in pl.unroll(
-                                SCORE_TILE // (2 * BLOCK_SIZE)
+                                CUBE_SCORE_TILE // (2 * BLOCK_SIZE)
                             ):
                                 cube_scale_begin = cube_scale_page * BLOCK_SIZE
                                 cube_safe_scale_begin = pl.min(
@@ -620,9 +624,56 @@ def indexer_score_topk_forest(
                                 pl.tile.store(
                                     cube_score_valid,
                                     [cube_score_row_id, cube_score_col],
-                                    score_arena,
+                                    cube_score_arena,
                                 )
-                else:
+                    if single_leaf == 0:
+                        for sort_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                            half_begin = logical_begin + sort_lane * lane_span
+                            half_valid = pl.max(pl.min(valid_count - sort_lane * lane_span, lane_span), 0)
+                            half_slot = query * TOPK_ROWS_PER_QUERY + leaf * 2 + sort_lane
+                            if half_valid > 0:
+                                indexer_topk_half_leaf(cube_score_arena, pair_arena, worker * 2 + sort_lane, half_begin, half_valid, half_slot)
+                            else:
+                                empty_pairs = pl.tile.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
+                                pl.store(empty_pairs, [half_slot, 0], pair_arena)
+
+
+    with pl.spmd(
+        TOPK_SCORE_WORKERS,
+        name_hint="indexer_score_topk_leaf_vector",
+        deps=[qh_quant_tid, weights_tid, cache_write_tid],
+        allow_early_resolve=True,
+        optimizations=[pl.cross_core_slot(slot_num=1)],
+    ) as vector_score_tid:
+        worker = pl.tile.get_block_idx()
+        max_cache_len = 0
+        for batch in pl.range(query_count // S):
+            batch_cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
+            max_cache_len = pl.max(max_cache_len, batch_cache_len)
+        max_leaves = pl.max((pl.min(max_cache_len, TOPK_MAX_CANDIDATES) + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF, 1)
+        single_leaf = pl.cast(max_leaves == 1, pl.INDEX)
+        for item in pl.range(worker, query_count * max_leaves, TOPK_SCORE_WORKERS):
+            query = item // max_leaves
+            leaf = item % max_leaves
+            batch_idx = query // S
+            position = pl.read(position_ids, [query])
+            cache_len = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
+            cache_bound = pl.min(cache_len, (position + 1) // COMPRESS_RATIO)
+            visible_count = pl.max(pl.min(cache_bound, TOPK_MAX_CANDIDATES), 0)
+            logical_begin = leaf * TOPK_CANDIDATES_PER_LEAF
+            if visible_count < CUBE_SCORE_MIN_CANDIDATES:
+                if logical_begin < visible_count:
+                    valid_count = pl.min(TOPK_CANDIDATES_PER_LEAF, visible_count - logical_begin)
+                    # Each half-leaf must fit the 4096-candidate sort path.
+                    lane_span = pl.min(
+                        ((valid_count + VECTOR_SCORE_TILE - 1) // VECTOR_SCORE_TILE) * VECTOR_SCORE_LANE_ROWS,
+                        TOPK_CANDIDATES_PER_LEAF // 2,
+                    )
+                    lane_stride = single_leaf * VECTOR_SCORE_LANE_ROWS + (1 - single_leaf) * lane_span
+                    query_head_begin = query * IDX_N_HEADS
+                    # The INT8 QK matmul is shared by both score paths. Keep Q in
+                    # L0A across candidate tiles; only long contexts prepare the
+                    # FP16 coefficient operand for the second Cube matmul.
                     vector_query = pl.tile.load(
                         qr_hadamard_i8,
                         [query_head_begin, 0],
@@ -655,19 +706,19 @@ def indexer_score_topk_forest(
                             [IDX_N_HEADS, 1],
                         )
                     for vector_score_begin in pl.pipeline(
-                        0, lane_span, SCORE_LANE_ROWS, stage=2
+                        0, lane_span, VECTOR_SCORE_LANE_ROWS, stage=2
                     ):
                         vector_read_begin = vector_score_begin * (1 + single_leaf)
                         vector_kv_i8 = pl.tile.create(
-                            [SCORE_TILE, IDX_HEAD_DIM],
+                            [VECTOR_SCORE_TILE, IDX_HEAD_DIM],
                             pl.INT8,
                             target_memory=pl.Mem.Mat,
                         )
-                        for vector_page in pl.unroll(SCORE_TILE // BLOCK_SIZE):
+                        for vector_page in pl.unroll(VECTOR_SCORE_TILE // BLOCK_SIZE):
                             vector_page_begin = vector_page * BLOCK_SIZE
                             vector_lane_page = (
-                                vector_page_begin // SCORE_LANE_ROWS
-                            ) * lane_stride + vector_page_begin % SCORE_LANE_ROWS
+                                vector_page_begin // VECTOR_SCORE_LANE_ROWS
+                            ) * lane_stride + vector_page_begin % VECTOR_SCORE_LANE_ROWS
                             vector_safe_page_begin = pl.min(
                                 vector_read_begin + vector_lane_page,
                                 ((valid_count - 1) // BLOCK_SIZE) * BLOCK_SIZE,
@@ -705,17 +756,17 @@ def indexer_score_topk_forest(
                                     valid_count
                                     - vector_read_begin
                                     - vector_lane_begin,
-                                    SCORE_LANE_ROWS,
+                                    VECTOR_SCORE_LANE_ROWS,
                                 ),
                                 0,
                             )
                             vector_kv_scale = pl.tile.create(
-                                [1, SCORE_LANE_ROWS],
+                                [1, VECTOR_SCORE_LANE_ROWS],
                                 pl.FP32,
                                 target_memory=pl.Mem.Vec,
                             )
                             for vector_scale_page in pl.unroll(
-                                SCORE_TILE // (2 * BLOCK_SIZE)
+                                VECTOR_SCORE_TILE // (2 * BLOCK_SIZE)
                             ):
                                 vector_scale_begin = vector_scale_page * BLOCK_SIZE
                                 vector_safe_scale_begin = pl.min(
@@ -758,7 +809,7 @@ def indexer_score_topk_forest(
                             vector_score_sum = pl.col_sum(vector_score_fp32)
                             vector_score_row = pl.mul(
                                 pl.tile.reshape(
-                                    vector_score_sum, [1, SCORE_LANE_ROWS]
+                                    vector_score_sum, [1, VECTOR_SCORE_LANE_ROWS]
                                 ),
                                 vector_kv_scale,
                             )
@@ -778,19 +829,21 @@ def indexer_score_topk_forest(
                                 pl.tile.store(
                                     vector_score_valid,
                                     [vector_score_row_id, vector_score_col],
-                                    score_arena,
+                                    vector_score_arena,
                                 )
-                if single_leaf == 0:
-                    for sort_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                        half_begin = logical_begin + sort_lane * lane_span
-                        half_valid = pl.max(pl.min(valid_count - sort_lane * lane_span, lane_span), 0)
-                        half_slot = query * TOPK_ROWS_PER_QUERY + leaf * 2 + sort_lane
-                        if half_valid > 0:
-                            indexer_topk_half_leaf(score_arena, pair_arena, worker * 2 + sort_lane, half_begin, half_valid, half_slot)
-                        else:
-                            empty_pairs = pl.tile.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
-                            pl.store(empty_pairs, [half_slot, 0], pair_arena)
+                    if single_leaf == 0:
+                        for sort_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                            half_begin = logical_begin + sort_lane * lane_span
+                            half_valid = pl.max(pl.min(valid_count - sort_lane * lane_span, lane_span), 0)
+                            half_slot = query * TOPK_ROWS_PER_QUERY + leaf * 2 + sort_lane
+                            if half_valid > 0:
+                                indexer_topk_half_leaf(vector_score_arena, pair_arena, worker * 2 + sort_lane, half_begin, half_valid, half_slot)
+                            else:
+                                empty_pairs = pl.tile.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
+                                pl.store(empty_pairs, [half_slot, 0], pair_arena)
 
+
+    score_tid = pl.system.task_dummy(deps=[cube_score_tid, vector_score_tid])
     max_topk_cache_len = 0
     for topk_batch in pl.range(b_dim):
         topk_cache_len = pl.read(kv_seq_lens, [topk_batch]) // COMPRESS_RATIO
@@ -798,7 +851,7 @@ def indexer_score_topk_forest(
     with pl.scope():
         if max_topk_cache_len <= TOPK_CANDIDATES_PER_LEAF:
             with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_topk_single_leaf_publish", deps=[score_tid], allow_early_resolve=True):
-                indexer_topk_single_leaf_publish(position_ids, kv_seq_lens, score_arena, topk_scores, topk_idxs)
+                indexer_topk_single_leaf_publish(position_ids, kv_seq_lens, vector_score_arena, topk_scores, topk_idxs)
         else:
             with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_topk_query_merge", deps=[score_tid], allow_early_resolve=True):
                 indexer_topk_query_merge(position_ids, kv_seq_lens, pair_arena, topk_scores, topk_idxs)
