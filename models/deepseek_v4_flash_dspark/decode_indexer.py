@@ -1297,25 +1297,47 @@ if __name__ == "__main__":
         actual_set = torch.sort(actual.cpu(), dim=-1).values
         expected_set = torch.sort(expected.cpu(), dim=-1).values
         mismatch = actual_set != expected_set
-        if not mismatch.any():
-            return True, ""
         mismatch_count = int(mismatch.sum().item())
         total = mismatch.numel()
         row_count = int(mismatch.any(dim=-1).sum().item())
-        first_row = int(mismatch.any(dim=-1).nonzero()[0].item())
-        common_per_row = (
-            actual.cpu().unsqueeze(-1) == expected.cpu().unsqueeze(-2)
-        ).any(dim=-1).sum(dim=-1)
-        common_total = int(common_per_row.sum().item())
-        min_recall = float(common_per_row.min().item()) / actual.shape[-1]
+        recalls = []
+        common_per_row = []
+        expected_per_row = []
+        duplicate_rows = []
+        for row, (actual_row, expected_row) in enumerate(
+            zip(actual.cpu(), expected.cpu())
+        ):
+            actual_valid = actual_row[actual_row >= 0]
+            actual_unique = torch.unique(actual_valid)
+            expected_unique = torch.unique(expected_row[expected_row >= 0])
+            expected_count = int(expected_unique.numel())
+            expected_per_row.append(expected_count)
+
+            if actual_unique.numel() != actual_valid.numel():
+                duplicate_rows.append(row)
+                common_per_row.append(0)
+                recalls.append(0.0)
+                continue
+
+            common = int(torch.isin(expected_unique, actual_unique).sum().item())
+            common_per_row.append(common)
+            recalls.append(common / expected_count if expected_count else 1.0)
+
+        if not mismatch.any() and not duplicate_rows:
+            return True, ""
+        common_total = sum(common_per_row)
+        expected_total = sum(expected_per_row)
+        overall_recall = common_total / expected_total if expected_total else 1.0
+        min_recall = min(recalls, default=1.0)
         passed = min_recall >= 0.98
+        problem_rows = mismatch.any(dim=-1).nonzero().flatten().tolist()
+        first_row = (problem_rows + duplicate_rows)[0]
         return passed, (
             f"    topk set mismatch: {mismatch_count}/{total} entries "
             f"across {row_count}/{mismatch.shape[0]} rows\n"
-            f"    set intersection: {common_total}/{total} "
-            f"(recall={common_total / total:.8f}), "
-            f"per-row min={int(common_per_row.min())}, "
-            f"max={int(common_per_row.max())}\n"
+            f"    valid unique intersection: {common_total}/{expected_total} "
+            f"(recall={overall_recall:.8f}), per-row min={min_recall:.8f}\n"
+            f"    duplicate valid-index rows: {duplicate_rows}\n"
             f"    row {first_row} actual[:16]={actual[first_row, :16].tolist()}\n"
             f"    row {first_row} expected[:16]={expected[first_row, :16].tolist()}\n"
             f"    row {first_row} actual_scores[:16]="
