@@ -28,7 +28,6 @@ from config import (
 T_DYN = pl.dynamic("QKV_Q_T_DYN")  # T = B * S
 KV_T_DYN = pl.dynamic("QKV_KV_T_DYN")
 ROPE_T_DYN = pl.dynamic("QKV_ROPE_T_DYN")
-QPROJ_MM_T_DYN = pl.dynamic("QKV_QPROJ_MM_T_DYN")
 
 # Bounded physical-row tile for Q/KV projection scratch.
 PREFILL_DENSE_TILE = 512
@@ -398,12 +397,12 @@ def q_proj_qr(
 def q_proj_q_matmul(
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
     qr_i8_matmul: pl.Tensor[[QPROJ_T_PAD, Q_LORA], pl.INT8],
-    q_proj_i32: pl.Tensor[[QPROJ_MM_T_DYN, H * HEAD_DIM], pl.INT32],
+    q_proj_i32: pl.Tensor[[QPROJ_T_PAD, H * HEAD_DIM], pl.INT32],
     tile_rows: pl.Scalar[pl.INDEX],
     qproj_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Project one bounded Q tile and expose its cube task ID."""
-    qproj_t_matmul = pl.tensor.dim(q_proj_i32, 0)
+    qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
     qproj_full_rows = (tile_rows // QPROJ_M_TILE) * QPROJ_M_TILE
     with pl.spmd(
         QPROJ_WORKERS, name_hint="qproj_matmul", deps=[qproj_dep],
@@ -430,7 +429,7 @@ def q_proj_q_matmul(
                     tail_t0 : tail_t0 + QPROJ_TAIL_M_TILE,
                     tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
                 ] = tail_acc
-    return q_proj_i32, qproj_tid
+    return qproj_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -441,7 +440,7 @@ def q_proj_q_dequant(
     rope_swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     qr_scale_pad_store: pl.Tensor[[QPROJ_T_PAD, 1], pl.FP32],
-    q_proj_i32: pl.Tensor[[QPROJ_MM_T_DYN, H * HEAD_DIM], pl.INT32],
+    q_proj_i32: pl.Tensor[[QPROJ_T_PAD, H * HEAD_DIM], pl.INT32],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
 ):
@@ -610,9 +609,8 @@ def q_proj_q(
     for tile_base in pl.range(0, t_dim, PREFILL_DENSE_TILE):
         tile_rows = pl.min(PREFILL_DENSE_TILE, t_dim - tile_base)
         with pl.scope():
-            qproj_t_matmul = ((tile_rows + QPROJ_TAIL_M_TILE - 1) // QPROJ_TAIL_M_TILE) * QPROJ_TAIL_M_TILE
-            q_proj_i32 = pl.create_tensor([qproj_t_matmul, H * HEAD_DIM], dtype=pl.INT32)
-            q_proj_i32, _qproj_tid = q_proj_q_matmul(
+            q_proj_i32 = pl.create_tensor([QPROJ_T_PAD, H * HEAD_DIM], dtype=pl.INT32)
+            _qproj_tid = q_proj_q_matmul(
                 wq_b, qr_i8_matmul, q_proj_i32, tile_rows, qproj_dep,
             )
             q_proj_q_dequant(
