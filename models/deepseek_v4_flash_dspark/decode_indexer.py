@@ -559,6 +559,7 @@ def indexer_score_topk_forest(
         with pl.spmd(
             TOPK_SCORE_WORKERS,
             name_hint="indexer_score_topk_buffered",
+            sync_start=True,
             deps=[qh_quant_tid, weights_tid, cache_write_tid],
             allow_early_resolve=True,
         ) as buffered_leaf_tid:
