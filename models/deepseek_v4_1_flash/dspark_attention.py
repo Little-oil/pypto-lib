@@ -201,6 +201,35 @@ def dspark_attention_test(
     )
 
 
+def golden_attend_dspark_window(query, cache, indices, sink):
+    """Apply 64-key online softmax with BF16 weights and FP32 statistics."""
+    import torch
+
+    flat_cache = cache.flatten(0, 1).squeeze(-2)
+    selected = flat_cache[indices.clamp_min(0).long()].float()
+    maximum = torch.full(query.shape[:2], -1e30, dtype=torch.float32)
+    denominator = torch.zeros_like(maximum)
+    numerator = torch.zeros_like(query, dtype=torch.float32)
+    for start in range(0, indices.shape[-1], 64):
+        keys = selected[:, start:start + 64]
+        scores = torch.einsum("thd,tkd->thk", query.float(), keys) * SOFTMAX_SCALE
+        valid = (indices[:, start:start + 64] >= 0).unsqueeze(1)
+        scores = scores + (~valid).float() * -1e30
+        next_max = torch.maximum(maximum, scores.amax(dim=-1))
+        correction = torch.exp(maximum - next_max)
+        probabilities = torch.exp(scores - next_max.unsqueeze(-1)) * valid
+        denominator = denominator * correction + probabilities.sum(dim=-1)
+        weights = probabilities.to(torch.bfloat16).float()
+        weighted = torch.einsum("thk,tkd->thd", weights, keys)
+        numerator = numerator * correction.unsqueeze(-1) + weighted
+        maximum = next_max
+    sinks = sink.float().unsqueeze(0)
+    final_max = torch.maximum(maximum, sinks)
+    correction = torch.exp(maximum - final_max)
+    denominator = denominator * correction + torch.exp(sinks - final_max)
+    return (numerator * (correction / denominator).unsqueeze(-1)).to(query.dtype)
+
+
 def make_attention_inputs(seed: int = 43):
     """Prepare five queries sharing history and all current KV rows."""
     import torch
@@ -239,7 +268,10 @@ if __name__ == "__main__":
     values = make_attention_inputs()
 
     def golden(tensors):
-        result = golden_swa_attention(*(tensors[name] for name in SWA_INPUT_NAMES))
+        result = golden_swa_attention(
+            *(tensors[name] for name in SWA_INPUT_NAMES), attention_fn=golden_attend_dspark_window,
+            output_dtype=torch.float32, sequential_query=True,
+        )
         tensors["output"].copy_(result.output)
         tensors["window_cache"].copy_(result.window_cache)
         tensors["window_cache_scale"].copy_(result.window_cache_scale)
