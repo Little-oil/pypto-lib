@@ -12,7 +12,7 @@
 import pypto.language as pl
 
 from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, ORI_BLOCKS_DYN, TP_SIZE, T_DYN
-from o_proj import o_proj
+from o_proj import GROUPED_WORKER_TILE, o_proj
 from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
 from sparse_attention import publish_window_row
 
@@ -146,7 +146,7 @@ def dspark_attention(
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens, max_workers=2147483647)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
@@ -154,7 +154,10 @@ def dspark_attention(
     gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens,
+        grouped_max_workers=GROUPED_WORKER_TILE,
+    )
     return output, window_cache, window_cache_scale
 
 
