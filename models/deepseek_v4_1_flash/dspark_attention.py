@@ -234,15 +234,15 @@ if __name__ == "__main__":
     import torch
 
     from golden import ScalarSpec, TensorSpec, ratio_allclose, run
-    from sparse_attention import SWA_INPUT_NAMES, golden_swa_attention
+    from sparse_attention import SWA_INPUT_NAMES, swa_official_reference
 
     values = make_attention_inputs()
 
     def golden(tensors):
-        result = golden_swa_attention(*(tensors[name] for name in SWA_INPUT_NAMES))
-        tensors["output"].copy_(result.output)
-        tensors["window_cache"].copy_(result.window_cache)
-        tensors["window_cache_scale"].copy_(result.window_cache_scale)
+        output, cache, scales = swa_official_reference(tensors, key_tile=64)
+        tensors["output"].copy_(output)
+        tensors["window_cache"].copy_(cache)
+        tensors["window_cache_scale"].copy_(scales)
 
     def compare_payload(actual, expected, **_kwargs):
         return bool(torch.allclose(actual.float(), expected.float(), rtol=0.05, atol=0.05)), "FP8 payload"
